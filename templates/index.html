@@ -1,0 +1,970 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CPU Instruction Pipeline Scheduler</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Courier New', monospace;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+
+        .container {
+            max-width: 100%;
+            margin: 0 auto;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+            color: #333;
+            font-family: Arial, sans-serif;
+        }
+
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .control-group {
+            margin-bottom: 15px;
+        }
+
+        .control-group label {
+            display: inline-block;
+            width: 100px;
+            font-weight: bold;
+            font-family: Arial, sans-serif;
+        }
+
+        .control-group input[type="range"] {
+            width: 300px;
+            vertical-align: middle;
+        }
+
+        .control-group span {
+            display: inline-block;
+            width: 50px;
+            text-align: center;
+            font-weight: bold;
+            color: #0066cc;
+        }
+
+        .rules-panel {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .rules-panel h3 {
+            margin-bottom: 10px;
+            color: #333;
+            font-family: Arial, sans-serif;
+        }
+
+        .rule-item {
+            padding: 8px;
+            margin-bottom: 8px;
+            background-color: #f9f9f9;
+            border-left: 4px solid #0066cc;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+        }
+
+        .rule-item.disabled {
+            opacity: 0.5;
+            border-left-color: #999;
+        }
+
+        .rule-item input[type="checkbox"] {
+            margin-right: 10px;
+            cursor: pointer;
+        }
+
+        .rule-item strong {
+            color: #0066cc;
+            margin-right: 5px;
+        }
+
+        .violations-summary {
+            padding: 10px;
+            background-color: #fff3cd;
+            border: 2px solid #ffc107;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            font-family: Arial, sans-serif;
+            font-size: 14px;
+            display: none;
+        }
+
+        .violations-summary.active {
+            display: block;
+        }
+
+        .block-palette {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .block-palette h3 {
+            margin-bottom: 10px;
+            color: #333;
+            font-family: Arial, sans-serif;
+        }
+
+        .palette-blocks {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+
+        .palette-block {
+            width: 40px;
+            height: 40px;
+            border: 2px solid #333;
+            background-color: #fff;
+            cursor: grab;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 16px;
+            border-radius: 4px;
+            user-select: none;
+        }
+
+        .palette-block:hover {
+            background-color: #e0e0e0;
+        }
+
+        .palette-block.dragging {
+            opacity: 0.5;
+            cursor: grabbing;
+        }
+
+        .grid-container {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: auto;
+        }
+
+        .grid-wrapper {
+            display: flex;
+        }
+
+        .row-labels {
+            display: flex;
+            flex-direction: column;
+            margin-right: 10px;
+        }
+
+        .row-label {
+            height: 50px;
+            min-width: 300px;
+            border: none;
+            padding: 5px;
+            display: flex;
+            align-items: center;
+            background-color: #f9f9f9;
+            gap: 5px;
+            position: relative;
+            margin-bottom: 1px;
+        }
+
+        .row-label.violation {
+            animation: pulse-yellow 1s ease-in-out infinite;
+        }
+
+        .row-label select {
+            padding: 4px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            min-width: 60px;
+            background-color: white;
+        }
+
+        .row-label input {
+            padding: 4px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            width: 50px;
+        }
+
+        .row-label input:focus,
+        .row-label select:focus {
+            outline: 2px solid #0066cc;
+            background-color: white;
+        }
+
+        .operand-container {
+            display: flex;
+            gap: 3px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .instruction-display {
+            font-weight: bold;
+            color: #333;
+            white-space: nowrap;
+        }
+
+        .grid {
+            display: grid;
+            gap: 1px;
+            border: 2px solid #333;
+            background-color: #ccc;
+        }
+
+        .grid-cell {
+            width: 50px;
+            height: 50px;
+            border: none;
+            background-color: white;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 16px;
+            position: relative;
+        }
+
+        .grid-cell.drag-over {
+            background-color: #e3f2fd;
+            border: 2px dashed #0066cc;
+        }
+
+        .grid-cell.violation {
+            animation: pulse-yellow 1s ease-in-out infinite;
+            border: 1px solid #ddd;
+        }
+
+        .row-label.violation {
+            animation: pulse-yellow 1s ease-in-out infinite;
+            border: 1px solid #ddd;
+        }
+
+        @keyframes pulse-yellow {
+            0%, 100% {
+                box-shadow: inset 0 0 0 0 rgba(255, 193, 7, 0);
+            }
+            50% {
+                box-shadow: inset 0 0 0 3px rgba(255, 193, 7, 1);
+            }
+        }
+
+        .grid-cell .block {
+            cursor: grab;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #d32f2f;
+            font-weight: bold;
+        }
+
+        .grid-cell .block:hover {
+            background-color: #ffebee;
+        }
+
+        .grid-cell .block.dragging {
+            opacity: 0.5;
+            cursor: grabbing;
+        }
+
+        .actions {
+            margin-top: 20px;
+            display: flex;
+            gap: 10px;
+        }
+
+        button {
+            padding: 10px 20px;
+            background-color: #0066cc;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-family: Arial, sans-serif;
+        }
+
+        button:hover {
+            background-color: #0052a3;
+        }
+
+        button.secondary {
+            background-color: #666;
+        }
+
+        button.secondary:hover {
+            background-color: #555;
+        }
+
+        .comma {
+            margin: 0 2px;
+        }
+
+        .paren {
+            margin: 0 1px;
+        }
+
+        .rule-controls {
+            margin-bottom: 10px;
+            display: flex;
+            gap: 10px;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>CPU Instruction Pipeline Scheduler</h1>
+
+    <div class="controls">
+        <div class="control-group">
+            <label for="rows-slider">Rows:</label>
+            <input type="range" id="rows-slider" min="0" max="100" value="10">
+            <span id="rows-value">10</span>
+        </div>
+        <div class="control-group">
+            <label for="cols-slider">Columns:</label>
+            <input type="range" id="cols-slider" min="0" max="100" value="10">
+            <span id="cols-value">10</span>
+        </div>
+
+        <div class="control-group" style="margin-top:10px;">
+            <label>Pipelines:</label>
+            <label><input type="radio" name="pipelines" value="1" checked onchange="updatePipelineCount()"> 1</label>
+            <label style="margin-left:10px;"><input type="radio" name="pipelines" value="2" onchange="updatePipelineCount()"> 2</label>
+        </div>
+    </div>
+
+    <div class="rules-panel">
+        <h3>Pipeline Rules</h3>
+
+        <div class="rule-controls">
+            <button id="enable-all-rules" onclick="toggleAllRules(true)">Enable All</button>
+            <button id="disable-all-rules" onclick="toggleAllRules(false)" class="secondary">Disable All</button>
+        </div>
+
+        <div id="rules-list">
+            <!-- Rules with checkboxes will be generated by JavaScript -->
+        </div>
+
+        <div id="violations-summary" class="violations-summary">
+            <strong>⚠️ Rule Violations Detected:</strong>
+            <div id="violations-list"></div>
+        </div>
+    </div>
+
+    <div class="block-palette">
+        <h3>Available Blocks (Drag to Grid)</h3>
+        <div class="palette-blocks" id="palette">
+            <!-- Blocks will be generated by JavaScript -->
+        </div>
+    </div>
+    <div class="grid-container">
+        <div class="grid-wrapper">
+            <div class="row-labels" id="row-labels">
+                <!-- Row labels will be generated by JavaScript -->
+            </div>
+            <div class="grid" id="grid">
+                <!-- Grid will be generated by JavaScript -->
+            </div>
+        </div>
+    </div>
+
+    <div class="actions">
+        <button onclick="saveState()">Save State</button>
+        <button onclick="loadState()" class="secondary">Load State</button>
+        <button onclick="clearGrid()" class="secondary">Clear Grid</button>
+    </div>
+</div>
+
+    <script>
+        const BLOCK_TYPES = ['F', 'D', 'i', 'I', 'Y0', 'Y1', 'Y2', 'Y3', 'W', 'r', 'C', 'X'];
+        const INSTRUCTION_FORMATS = {{ instruction_formats | tojson }};
+        const INSTRUCTION_NAMES = Object.keys(INSTRUCTION_FORMATS);
+        
+        let currentRows = 10;
+        let currentCols = 10;
+        let gridData = {};
+        let instructions = {};
+        let currentViolations = [];
+        let rulesInfo = [];
+        let currentPipelineCount = {{ pipeline_count }};
+
+        // Initialize palette
+        function initPalette() {
+            const palette = document.getElementById('palette');
+            palette.innerHTML = '';
+            BLOCK_TYPES.forEach(blockType => {
+                const block = document.createElement('div');
+                block.className = 'palette-block';
+                block.textContent = blockType;
+                block.draggable = true;
+                block.dataset.blockType
+                block.dataset.blockType = blockType;
+                
+                block.addEventListener('dragstart', (e) => {
+                    e.dataTransfer.setData('blockType', blockType);
+                    e.dataTransfer.setData('source', 'palette');
+                    block.classList.add('dragging');
+                });
+                
+                block.addEventListener('dragend', (e) => {
+                    block.classList.remove('dragging');
+                });
+                
+                palette.appendChild(block);
+            });
+        }
+
+        // Load rules and populate rules panel
+        async function loadRules() {
+            const response = await fetch('/api/rules');
+            const data = await response.json();
+            rulesInfo = data.rules || [];
+            renderRulesPanel();
+        }
+
+        function renderRulesPanel() {
+            const rulesList = document.getElementById('rules-list');
+            rulesList.innerHTML = '';
+
+            rulesInfo.forEach(rule => {
+                const ruleDiv = document.createElement('div');
+                ruleDiv.className = 'rule-item' + (rule.enabled ? '' : ' disabled');
+                
+                const checkbox = document.createElement('input');
+                checkbox.type = 'checkbox';
+                checkbox.checked = rule.enabled;
+                checkbox.onchange = () => toggleRule(rule.name, checkbox.checked);
+                
+                const content = document.createElement('span');
+                content.innerHTML = `<strong>${rule.name}:</strong> ${rule.description}`;
+                
+                ruleDiv.appendChild(checkbox);
+                ruleDiv.appendChild(content);
+                rulesList.appendChild(ruleDiv);
+            });
+        }
+
+        async function toggleRule(ruleName, enabled) {
+            await fetch('/api/rules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: ruleName, enabled: enabled })
+            });
+            
+            // Update local rules info
+            const rule = rulesInfo.find(r => r.name === ruleName);
+            if (rule) {
+                rule.enabled = enabled;
+            }
+            
+            renderRulesPanel();
+            await checkRules();
+        }
+
+        async function toggleAllRules(enabled) {
+            await fetch('/api/rules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ all: enabled })
+            });
+            
+            // Update local rules info
+            rulesInfo.forEach(rule => {
+                rule.enabled = enabled;
+            });
+            
+            renderRulesPanel();
+            await checkRules();
+        }
+
+        async function updatePipelineCount() {
+            const selected = document.querySelector('input[name="pipelines"]:checked');
+            if (selected) {
+                currentPipelineCount = parseInt(selected.value);
+                await fetch('/api/pipeline-count', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ pipeline_count: currentPipelineCount })
+                });
+                await checkRules();
+            }
+        }
+
+        // Create instruction editor for a row
+        function createInstructionEditor(row) {
+            const container = document.createElement('div');
+            container.className = 'operand-container';
+            
+            const select = document.createElement('select');
+            const defaultOption = document.createElement('option');
+            defaultOption.value = '';
+            defaultOption.textContent = '-- Select --';
+            select.appendChild(defaultOption);
+            
+            INSTRUCTION_NAMES.forEach(name => {
+                const option = document.createElement('option');
+                option.value = name;
+                option.textContent = name;
+                select.appendChild(option);
+            });
+            
+            if (instructions[row]) {
+                select.value = instructions[row].name;
+            }
+            
+            select.addEventListener('change', (e) => {
+                updateInstruction(row, e.target.value);
+            });
+            
+            container.appendChild(select);
+            
+            if (instructions[row] && instructions[row].name) {
+                addOperandInputs(container, row, instructions[row]);
+            }
+            
+            return container;
+        }
+
+        function addOperandInputs(container, row, instruction) {
+            const format = INSTRUCTION_FORMATS[instruction.name];
+            if (!format) return;
+            
+            const operands = format.operands;
+            
+            if (instruction.name === 'lw' || instruction.name === 'sw') {
+                if (instruction.name === 'lw') {
+                    addOperandInput(container, row, 'rd', instruction.operands.rd || '');
+                    container.appendChild(document.createTextNode(', '));
+                    addOperandInput(container, row, 'imm', instruction.operands.imm || '0');
+                    container.appendChild(document.createTextNode('('));
+                    addOperandInput(container, row, 'rs1', instruction.operands.rs1 || '');
+                    container.appendChild(document.createTextNode(')'));
+                } else {
+                    addOperandInput(container, row, 'rs2', instruction.operands.rs2 || '');
+                    container.appendChild(document.createTextNode(', '));
+                    addOperandInput(container, row, 'imm', instruction.operands.imm || '0');
+                    container.appendChild(document.createTextNode('('));
+                    addOperandInput(container, row, 'rs1', instruction.operands.rs1 || '');
+                    container.appendChild(document.createTextNode(')'));
+                }
+            } else {
+                operands.forEach((operand, idx) => {
+                    if (idx > 0) {
+                        container.appendChild(document.createTextNode(', '));
+                    }
+                    addOperandInput(container, row, operand, instruction.operands[operand] || '');
+                });
+            }
+        }
+
+        function addOperandInput(container, row, operandName, value) {
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.value = value;
+            input.placeholder = operandName;
+            input.dataset.operand = operandName;
+            
+            input.addEventListener('change', (e) => {
+                if (!instructions[row]) {
+                    instructions[row] = { name: '', operands: {} };
+                }
+                instructions[row].operands[operandName] = e.target.value;
+                saveInstruction(row);
+            });
+            
+            container.appendChild(input);
+        }
+
+        function updateInstruction(row, instructionName) {
+            if (!instructionName) {
+                delete instructions[row];
+                saveInstruction(row);
+                generateGrid();
+                return;
+            }
+            
+            const format = INSTRUCTION_FORMATS[instructionName];
+            instructions[row] = {
+                name: instructionName,
+                operands: {}
+            };
+            
+            format.operands.forEach(operand => {
+                if (operand.startsWith('rs') || operand === 'rd') {
+                    instructions[row].operands[operand] = operand;
+                } else if (operand === 'imm') {
+                    instructions[row].operands[operand] = '0';
+                }
+            });
+            
+            saveInstruction(row);
+            generateGrid();
+        }
+
+        // Check rules and update UI
+        async function checkRules() {
+            const response = await fetch('/api/check-rules');
+            const data = await response.json();
+            currentViolations = data.violations || [];
+            
+            updateViolationUI();
+        }
+
+        function updateViolationUI() {
+            // Clear all violation classes
+            document.querySelectorAll('.grid-cell').forEach(cell => {
+                cell.classList.remove('violation');
+            });
+            document.querySelectorAll('.row-label').forEach(label => {
+                label.classList.remove('violation');
+            });
+
+            const violationsSummary = document.getElementById('violations-summary');
+            const violationsList = document.getElementById('violations-list');
+
+            if (currentViolations.length === 0) {
+                violationsSummary.classList.remove('active');
+                return;
+            }
+
+            // Show violations summary
+            violationsSummary.classList.add('active');
+            violationsList.innerHTML = '';
+
+            currentViolations.forEach(violation => {
+                // Highlight affected cells
+                violation.cells.forEach(cell => {
+                    const cellElement = document.querySelector(
+                        `.grid-cell[data-row="${cell.row}"][data-col="${cell.col}"]`
+                    );
+                    if (cellElement) {
+                        cellElement.classList.add('violation');
+                    }
+                });
+
+                // Highlight affected rows
+                violation.rows.forEach(rowNum => {
+                    const rowLabel = document.querySelector(
+                        `.row-label[data-row="${rowNum}"]`
+                    );
+                    if (rowLabel) {
+                        rowLabel.classList.add('violation');
+                    }
+                });
+
+                // Add violation to list
+                const violationItem = document.createElement('div');
+                violationItem.textContent = `• ${violation.message}`;
+                violationItem.style.marginLeft = '10px';
+                violationItem.style.marginTop = '5px';
+                violationsList.appendChild(violationItem);
+            });
+        }
+        // Generate grid
+        function generateGrid() {
+            const grid = document.getElementById('grid');
+            const rowLabelsDiv = document.getElementById('row-labels');
+
+            grid.innerHTML = '';
+            rowLabelsDiv.innerHTML = '';
+            grid.style.gridTemplateColumns = `repeat(${currentCols}, 50px)`;
+            grid.style.gridTemplateRows = `repeat(${currentRows}, 50px)`;
+
+            // Generate row labels with instruction editors
+            for (let row = 0; row < currentRows; row++) {
+                const labelDiv = document.createElement('div');
+                labelDiv.className = 'row-label';
+                labelDiv.dataset.row = row;
+
+                const editor = createInstructionEditor(row);
+                labelDiv.appendChild(editor);
+
+                rowLabelsDiv.appendChild(labelDiv);
+            }
+
+            // Generate grid cells
+            for (let row = 0; row < currentRows; row++) {
+                for (let col = 0; col < currentCols; col++) {
+                    const cell = document.createElement('div');
+                    cell.className = 'grid-cell';
+                    cell.dataset.row = row;
+                    cell.dataset.col = col;
+
+                    // Check if there's a block in this cell
+                    const key = `${row},${col}`;
+                    if (gridData[key]) {
+                        const block = document.createElement('div');
+                        block.className = 'block';
+                        block.textContent = gridData[key];
+                        block.draggable = true;
+
+                        block.addEventListener('dragstart', (e) => {
+                            e.dataTransfer.setData('blockType', gridData[key]);
+                            e.dataTransfer.setData('source', 'grid');
+                            e.dataTransfer.setData('sourceRow', row);
+                            e.dataTransfer.setData('sourceCol', col);
+                            block.classList.add('dragging');
+                        });
+
+                        block.addEventListener('dragend', (e) => {
+                            block.classList.remove('dragging');
+                        });
+
+                        cell.appendChild(block);
+                    }
+
+                    // Drop event handlers
+                    cell.addEventListener('dragover', (e) => {
+                        e.preventDefault();
+                        cell.classList.add('drag-over');
+                    });
+
+                    cell.addEventListener('dragleave', (e) => {
+                        cell.classList.remove('drag-over');
+                    });
+
+                    cell.addEventListener('drop', async (e) => {
+                        e.preventDefault();
+                        cell.classList.remove('drag-over');
+
+                        const blockType = e.dataTransfer.getData('blockType');
+                        const source = e.dataTransfer.getData('source');
+
+                        if (source === 'grid') {
+                            const sourceRow = parseInt(e.dataTransfer.getData('sourceRow'));
+                            const sourceCol = parseInt(e.dataTransfer.getData('sourceCol'));
+                            const sourceKey = `${sourceRow},${sourceCol}`;
+                            delete gridData[sourceKey];
+                            await saveBlock(sourceRow, sourceCol, null);
+                        }
+
+                        const key = `${row},${col}`;
+                        gridData[key] = blockType;
+                        await saveBlock(row, col, blockType);
+                        generateGrid();
+                        await checkRules();
+                    });
+
+                    // Right-click to remove block
+                    cell.addEventListener('contextmenu', async (e) => {
+                        e.preventDefault();
+                        const key = `${row},${col}`;
+                        if (gridData[key]) {
+                            delete gridData[key];
+                            await saveBlock(row, col, null);
+                            generateGrid();
+                            await checkRules();
+                        }
+                    });
+
+                    grid.appendChild(cell);
+                }
+            }
+
+            // Check rules after grid generation
+            checkRules();
+        }
+
+        // Slider event handlers
+        document.getElementById('rows-slider').addEventListener('input', (e) => {
+            currentRows = parseInt(e.target.value);
+            document.getElementById('rows-value').textContent = currentRows;
+            generateGrid();
+            saveResize();
+        });
+
+        document.getElementById('cols-slider').addEventListener('input', (e) => {
+            currentCols = parseInt(e.target.value);
+            document.getElementById('cols-value').textContent = currentCols;
+            generateGrid();
+            saveResize();
+        });
+
+        // API calls
+        async function saveBlock(row, col, blockType) {
+            await fetch('/api/block', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ row, col, block_type: blockType })
+            });
+        }
+
+        async function saveInstruction(row) {
+            await fetch('/api/instruction', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    row,
+                    instruction: instructions[row] || { name: '', operands: {} }
+                })
+            });
+            await checkRules();
+        }
+
+        async function saveResize() {
+            await fetch('/api/resize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rows: currentRows, cols: currentCols })
+            });
+        }
+
+        async function loadStateFromServer() {
+            const response = await fetch('/api/state');
+            const state = await response.json();
+
+            gridData = state.grid_data || {};
+            instructions = state.instructions || {};
+            currentRows = state.rows || 10;
+            currentCols = state.cols || 10;
+            currentPipelineCount = state.pipeline_count || 1;
+
+            // Update sliders
+            document.getElementById('rows-slider').value = currentRows;
+            document.getElementById('cols-slider').value = currentCols;
+            document.getElementById('rows-value').textContent = currentRows;
+            document.getElementById('cols-value').textContent = currentCols;
+
+            // Update pipeline radio buttons
+            const pipelineRadio = document.querySelector(`input[name="pipelines"][value="${currentPipelineCount}"]`);
+            if (pipelineRadio) {
+                pipelineRadio.checked = true;
+            }
+
+            // Load rules info
+            if (state.rules) {
+                rulesInfo = state.rules;
+                renderRulesPanel();
+            }
+
+            generateGrid();
+        }
+
+        function saveState() {
+            const state = {
+                grid_data: gridData,
+                instructions: instructions,
+                rows: currentRows,
+                cols: currentCols,
+                pipeline_count: currentPipelineCount,
+                rules: rulesInfo
+            };
+            const json = JSON.stringify(state, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'pipeline_state.json';
+            a.click();
+        }
+
+        function loadState() {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = 'application/json';
+            input.onchange = async (e) => {
+                const file = e.target.files[0];
+                const reader = new FileReader();
+                reader.onload = async (event) => {
+                    const state = JSON.parse(event.target.result);
+                    gridData = state.grid_data || {};
+                    instructions = state.instructions || {};
+                    currentRows = state.rows || 10;
+                    currentCols = state.cols || 10;
+                    currentPipelineCount = state.pipeline_count || 1;
+
+                    // Update sliders
+                    document.getElementById('rows-slider').value = currentRows;
+                    document.getElementById('cols-slider').value = currentCols;
+                    document.getElementById('rows-value').textContent = currentRows;
+                    document.getElementById('cols-value').textContent = currentCols;
+
+                    // Update pipeline radio buttons
+                    const pipelineRadio = document.querySelector(`input[name="pipelines"][value="${currentPipelineCount}"]`);
+                    if (pipelineRadio) {
+                        pipelineRadio.checked = true;
+                    }
+
+                    // Update rules if provided
+                    if (state.rules) {
+                        rulesInfo = state.rules;
+                        renderRulesPanel();
+                    }
+
+                    generateGrid();
+
+                    // Send state to server
+                    await fetch('/api/state', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(state)
+                    });
+                };
+                reader.readAsText(file);
+            };
+            input.click();
+        }
+
+        async function clearGrid() {
+            if (confirm('Are you sure you want to clear the entire grid and all instructions?')) {
+                gridData = {};
+                instructions = {};
+                generateGrid();
+
+                await fetch('/api/state', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        grid_data: {},
+                        instructions: {},
+                        rows: currentRows,
+                        cols: currentCols,
+                        pipeline_count: currentPipelineCount,
+                        rules: rulesInfo
+                    })
+                });
+
+                // Explicitly check rules after clearing
+                await checkRules();
+            }
+        }
+
+        // Initialize
+        initPalette();
+        loadRules().then(() => {
+            loadStateFromServer();
+        });
+    </script>
+</body>
+</html>
