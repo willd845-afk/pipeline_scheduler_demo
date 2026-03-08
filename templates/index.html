@@ -419,7 +419,10 @@
         let rulesInfo = [];
         let currentPipelineCount = {{ pipeline_count }};
 
-        // Initialize palette
+        /**
+         * Initialize the block palette with draggable block elements.
+         * Creates DOM elements for each block type that can be dragged onto the grid.
+         */
         function initPalette() {
             const palette = document.getElementById('palette');
             palette.innerHTML = '';
@@ -445,7 +448,11 @@
             });
         }
 
-        // Load rules and populate rules panel
+        /**
+         * Load rules information from the server and populate the rules panel.
+         * Fetches the current rule configuration and renders checkboxes for each rule.
+         * @async
+         */
         async function loadRules() {
             const response = await fetch('/api/rules');
             const data = await response.json();
@@ -453,6 +460,10 @@
             renderRulesPanel();
         }
 
+        /**
+         * Render the rules panel with checkboxes for enabling/disabling rules.
+         * Updates the UI to reflect current rule states.
+         */
         function renderRulesPanel() {
             const rulesList = document.getElementById('rules-list');
             rulesList.innerHTML = '';
@@ -475,6 +486,13 @@
             });
         }
 
+        /**
+         * Toggle a specific rule on or off.
+         *
+         * @async
+         * @param {string} ruleName - The name of the rule to toggle
+         * @param {boolean} enabled - Whether to enable or disable the rule
+         */
         async function toggleRule(ruleName, enabled) {
             await fetch('/api/rules', {
                 method: 'POST',
@@ -492,6 +510,12 @@
             await checkRules();
         }
 
+        /**
+         * Enable or disable all rules at once.
+         *
+         * @async
+         * @param {boolean} enabled - Whether to enable or disable all rules
+         */
         async function toggleAllRules(enabled) {
             await fetch('/api/rules', {
                 method: 'POST',
@@ -508,6 +532,11 @@
             await checkRules();
         }
 
+        /**
+         * Update the pipeline count based on radio button selection.
+         * Sends the new count to the server and triggers rule re-checking.
+         * @async
+         */
         async function updatePipelineCount() {
             const selected = document.querySelector('input[name="pipelines"]:checked');
             if (selected) {
@@ -521,7 +550,13 @@
             }
         }
 
-        // Create instruction editor for a row
+        /**
+         * Create an instruction editor UI for a specific row.
+         * Generates a dropdown and operand inputs for instruction configuration.
+         *
+         * @param {number} row - The row index for this editor
+         * @returns {HTMLElement} The container element with instruction editor controls
+         */
         function createInstructionEditor(row) {
             const container = document.createElement('div');
             container.className = 'operand-container';
@@ -556,6 +591,14 @@
             return container;
         }
 
+        /**
+         * Add operand input fields to an instruction editor container.
+         * Handles special formatting for load/store instructions.
+         *
+         * @param {HTMLElement} container - The container to add inputs to
+         * @param {number} row - The row index
+         * @param {Object} instruction - The instruction object with name and operands
+         */
         function addOperandInputs(container, row, instruction) {
             const format = INSTRUCTION_FORMATS[instruction.name];
             if (!format) return;
@@ -588,6 +631,14 @@
             }
         }
 
+        /**
+         * Add a single operand input field to the container.
+         *
+         * @param {HTMLElement} container - The container to add the input to
+         * @param {number} row - The row index
+         * @param {string} operandName - The name of the operand (e.g., 'rd', 'rs1')
+         * @param {string} value - The current value of the operand
+         */
         function addOperandInput(container, row, operandName, value) {
             const input = document.createElement('input');
             input.type = 'text';
@@ -606,6 +657,13 @@
             container.appendChild(input);
         }
 
+        /**
+         * Update the instruction for a specific row when the instruction type changes.
+         * Initializes default operand values based on the instruction format.
+         *
+         * @param {number} row - The row index
+         * @param {string} instructionName - The name of the new instruction
+         */
         function updateInstruction(row, instructionName) {
             if (!instructionName) {
                 delete instructions[row];
@@ -632,7 +690,11 @@
             generateGrid();
         }
 
-        // Check rules and update UI
+        /**
+         * Check all enabled rules and update the UI with violations.
+         * Fetches violations from the server and highlights affected cells/rows.
+         * @async
+         */
         async function checkRules() {
             const response = await fetch('/api/check-rules');
             const data = await response.json();
@@ -641,6 +703,10 @@
             updateViolationUI();
         }
 
+        /**
+         * Update the UI to reflect current rule violations.
+         * Highlights violated cells and rows, displays violation messages.
+         */
         function updateViolationUI() {
             // Clear all violation classes
             document.querySelectorAll('.grid-cell').forEach(cell => {
@@ -691,7 +757,10 @@
                 violationsList.appendChild(violationItem);
             });
         }
-        // Generate grid
+        /**
+         * Generate the scheduling grid and row labels with instruction editors.
+         * Creates the complete grid UI including drag-and-drop handlers.
+         */
         function generateGrid() {
             const grid = document.getElementById('grid');
             const rowLabelsDiv = document.getElementById('row-labels');
@@ -811,7 +880,14 @@
             saveResize();
         });
 
-        // API calls
+        /**
+         * Save a block placement to the server.
+         *
+         * @async
+         * @param {number} row - Row index
+         * @param {number} col - Column index
+         * @param {string|null} blockType - Block type string or null to clear
+         */
         async function saveBlock(row, col, blockType) {
             await fetch('/api/block', {
                 method: 'POST',
@@ -820,6 +896,12 @@
             });
         }
 
+        /**
+         * Save an instruction configuration to the server.
+         *
+         * @async
+         * @param {number} row - Row index
+         */
         async function saveInstruction(row) {
             await fetch('/api/instruction', {
                 method: 'POST',
@@ -832,6 +914,10 @@
             await checkRules();
         }
 
+        /**
+         * Save grid dimensions to the server.
+         * @async
+         */
         async function saveResize() {
             await fetch('/api/resize', {
                 method: 'POST',
@@ -840,6 +926,11 @@
             });
         }
 
+        /**
+         * Load the complete scheduler state from the server.
+         * Updates all client-side data structures and regenerates the UI.
+         * @async
+         */
         async function loadStateFromServer() {
             const response = await fetch('/api/state');
             const state = await response.json();
@@ -871,6 +962,10 @@
             generateGrid();
         }
 
+        /**
+         * Save the current scheduler state to a JSON file.
+         * Downloads the state as a JSON file for later restoration.
+         */
         function saveState() {
             const state = {
                 grid_data: gridData,
@@ -889,6 +984,10 @@
             a.click();
         }
 
+        /**
+         * Load scheduler state from a JSON file.
+         * Prompts the user to select a file and restores the state.
+         */
         function loadState() {
             const input = document.createElement('input');
             input.type = 'file';
@@ -936,6 +1035,11 @@
             input.click();
         }
 
+        /**
+         * Clear the entire grid and all instructions.
+         * Prompts for confirmation before clearing.
+         * @async
+         */
         async function clearGrid() {
             if (confirm('Are you sure you want to clear the entire grid and all instructions?')) {
                 gridData = {};
