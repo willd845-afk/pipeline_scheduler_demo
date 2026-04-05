@@ -128,6 +128,19 @@ h1 {
     gap: 10px;
 }
 
+.circle {
+    height: 25px;
+    width: 25px;
+    background-color: #01fdba;
+    border-radius: 50%;
+    display: inline-block;
+    clip-path: circle(50% at 50% 50%);
+}
+
+.circle:hover {
+    background-color: #e0e0e0;
+}
+
 .palette-block {
     width: 40px;
     height: 40px;
@@ -330,4 +343,235 @@ button.secondary:hover {
     margin-bottom: 10px;
     display: flex;
     gap: 10px;
+}
+
+/* ====================================
+   Pipeline Mode Grid Behaviour
+   Applied to #grid when annotation mode
+   is active; makes blocks pass through
+   mouse events to the cell beneath them
+   ==================================== */
+.grid.pipeline-mode {
+    cursor: crosshair;
+}
+
+.grid.pipeline-mode .grid-cell .block {
+    pointer-events: none; /* Clicks/hovers fall through to the cell */
+    cursor: crosshair;
+}
+
+/* Cell hover highlight while in pipeline mode.
+   Uses CSS variables set per-type in selectPipelineType()
+   so the tint colour matches the selected annotation type */
+.grid.pipeline-mode .grid-cell:hover {
+    background-color: var(--pipeline-hover-bg,  rgba(0, 102, 204, 0.15));
+    outline: 2px solid var(--pipeline-hover-border, rgba(0, 102, 204, 0.40));
+    outline-offset: -2px;
+}
+
+/* ====================================
+   Annotation List Panel
+   Sits to the right of the grid wrapper
+   inside grid-container
+   ==================================== */
+.grid-and-annotations {
+    display: flex;
+    gap: 20px;
+    align-items: flex-start;
+}
+
+.annotation-panel {
+    background: white;
+    border: 1px solid #ddd;
+    border-radius: 8px;
+    padding: 12px;
+    min-width: 200px;
+    max-width: 280px;
+    max-height: 600px;
+    overflow-y: auto;
+    flex-shrink: 0;
+    font-family: Arial, sans-serif;
+    font-size: 13px;
+}
+
+.annotation-panel h3 {
+    margin-bottom: 10px;
+    color: #333;
+    font-size: 14px;
+}
+
+.annotation-panel-empty {
+    color: #999;
+    font-style: italic;
+}
+
+.annotation-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 7px 6px;
+    margin-bottom: 6px;
+    background-color: #f9f9f9;
+    border-radius: 4px;
+    border-left: 3px solid transparent; /* colour set inline */
+}
+
+.annotation-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    margin-top: 3px;
+}
+
+.annotation-info {
+    flex-grow: 1;
+    line-height: 1.5;
+}
+
+.annotation-info strong {
+    color: #333;
+}
+
+/* Small ✕ button — overrides the global button styles */
+.annotation-delete {
+    padding: 0 4px;
+    background: none;
+    border: none;
+    color: #cc0000;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    flex-shrink: 0;
+    margin-top: 1px;
+}
+
+.annotation-delete:hover {
+    background: none;
+    color: #900000;
+}
+
+/* ====================================
+   Pipeline Tool Button and Type Dropdown
+   Sits to the right of the block palette;
+   button greys out while annotation mode
+   is active.
+   ==================================== */
+.palette-and-pipeline {
+    display: flex;
+    align-items: flex-start;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.pipeline-tool {
+    position: relative;
+    flex-shrink: 0;
+}
+
+.pipeline-btn {
+    padding: 8px 16px;
+    background-color: #0066cc;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: Arial, sans-serif;
+    font-size: 14px;
+    white-space: nowrap;
+}
+
+.pipeline-btn:hover:not(.active) {
+    background-color: #0052a3;
+}
+
+/* Greyed-out state while annotation mode is active */
+.pipeline-btn.active {
+    background-color: #999;
+    color: #eee;
+    cursor: pointer; /* still clickable to exit mode */
+}
+
+.pipeline-type-list {
+    display: none;
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    background: white;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+    z-index: 1000;
+    min-width: 220px;
+}
+
+.pipeline-type-list.visible {
+    display: block;
+}
+
+.pipeline-type-item {
+    padding: 8px 12px;
+    cursor: pointer;
+    font-family: Arial, sans-serif;
+    font-size: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.pipeline-type-item:hover {
+    background-color: #f0f0f0;
+}
+
+/* Coloured dot next to each type name */
+.pipeline-type-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+/* ====================================
+   SVG Annotation Overlay
+   Absolutely positioned over #grid;
+   pointer-events disabled by default so
+   normal grid interactions are unaffected.
+   ==================================== */
+#grid-canvas {
+    position: relative;
+    display: inline-block;
+}
+
+#pipeline-svg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    overflow: visible; /* allow circles/arrows to extend beyond grid edge */
+}
+
+/* ====================================
+   Ghost Circle
+   Fixed-position div that tracks the
+   cursor while annotation mode is active.
+   Centred on the cursor via transform.
+   ==================================== */
+#ghost-circle {
+    position: fixed;
+    pointer-events: none;
+    z-index: 1000;
+    display: none;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: 2px solid rgba(0, 102, 204, 0.5);
+    background: rgba(0, 102, 204, 0.12);
+    transform: translate(-50%, -50%);
+    transition: border-color 0.1s ease, background-color 0.1s ease;
+}
+
+/* Blue outline on source cell while waiting for a target click */
+.grid-cell.pipeline-source {
+    outline: 3px solid #0066cc;
+    outline-offset: -3px;
 }

@@ -1,509 +1,8 @@
 # app.py
 from flask import Flask, render_template, jsonify, request
-from enum import Enum
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Set, Tuple
-from abc import ABC, abstractmethod
+from pipeline import Instruction, PipelineScheduler
 
 app = Flask(__name__)
-
-class InstructionType(Enum):
-    """
-    Enumeration of CPU instruction types.
-
-    Represents the different categories of RISC-V-style instructions
-    used in the pipeline scheduler.
-    """
-
-    R_TYPE = "R-type"
-    I_TYPE = "I-type"
-    I_STORE = "I-store"
-    B_TYPE = "B-type"
-    J_TYPE = "J-type"
-    JR_TYPE = "JR-type"
-
-@dataclass
-class InstructionFormat:
-    """
-    Defines the format specification for a CPU instruction.
-
-    Attributes:
-        name (str): The instruction mnemonic (e.g., 'add', 'lw')
-        instruction_type (InstructionType): The type category of the instruction
-        operands (List[str]): List of operand names (e.g., ['rd', 'rs1', 'rs2'])
-        syntax (str): Human-readable syntax example
-    """
-    name: str
-    instruction_type: InstructionType
-    operands: List[str]
-    syntax: str
-
-class Instruction:
-    """
-    Represents a CPU instruction with its operands.
-
-    Handles instruction creation, assembly generation, and serialization
-    for different instruction formats (R-type, I-type, etc.).
-    """
-    FORMATS = {
-        'add': InstructionFormat('add', InstructionType.R_TYPE, ['rd', 'rs1', 'rs2'], 'add rd, rs1, rs2'),
-        'addi': InstructionFormat('addi', InstructionType.I_TYPE, ['rd', 'rs1', 'imm'], 'addi rd, rs1, imm'),
-        'mul': InstructionFormat('mul', InstructionType.R_TYPE, ['rd', 'rs1', 'rs2'], 'mul rd, rs1, rs2'),
-        'bne': InstructionFormat('bne', InstructionType.B_TYPE, ['rs1', 'rs2', 'imm'], 'bne rs1, rs2, imm'),
-        'jr': InstructionFormat('jr', InstructionType.JR_TYPE, ['rs1'], 'jr rs1'),
-        'lw': InstructionFormat('lw', InstructionType.I_TYPE, ['rd', 'rs1', 'imm'], 'lw rd, imm(rs1)'),
-        'sw': InstructionFormat('sw', InstructionType.I_STORE, ['rs2', 'rs1', 'imm'], 'sw rs2, imm(rs1)'),
-        'jal': InstructionFormat('jal', InstructionType.J_TYPE, ['rd', 'imm'], 'jal rd, imm'),
-    }
-
-    def __init__(self, name: str, operands: dict = None):
-        """
-        Initialize an instruction instance.
-
-        Args:
-            name: The instruction mnemonic
-            operands: Dictionary mapping operand names to their values
-        """
-        self.name = name
-        self.format = self.FORMATS.get(name)
-        self.operands = operands or {}
-
-    def to_assembly(self) -> str:
-        """
-        Generate assembly string representation of the instruction.
-
-        Returns:
-            str: Assembly language string (e.g., "lw r1, 4(r2)")
-        """
-        if not self.format:
-            return self.name
-
-        parts = [self.name]
-
-        if self.format.instruction_type in [InstructionType.I_TYPE, InstructionType.I_STORE]:
-            if self.name in ['lw', 'sw']:
-                if self.name == 'lw':
-                    rd = self.operands.get('rd', 'rd')
-                    rs1 = self.operands.get('rs1', 'rs1')
-                    imm = self.operands.get('imm', '0')
-                    return f"{self.name} {rd}, {imm}({rs1})"
-                else:
-                    rs2 = self.operands.get('rs2', 'rs2')
-                    rs1 = self.operands.get('rs1', 'rs1')
-                    imm = self.operands.get('imm', '0')
-                    return f"{self.name} {rs2}, {imm}({rs1})"
-
-        operand_values = []
-        for operand_name in self.format.operands:
-            operand_values.append(self.operands.get(operand_name, operand_name))
-
-        if operand_values:
-            return f"{self.name} {', '.join(operand_values)}"
-        return self.name
-
-    def to_dict(self):
-        """
-        Serialize instruction to dictionary format.
-
-        Returns:
-            dict: Dictionary containing name and operands
-        """
-        return {
-            'name': self.name,
-            'operands': self.operands
-        }
-
-    @classmethod
-    def from_dict(cls, data):
-        """
-        Deserialize instruction from dictionary format.
-
-        Args:
-            data: Dictionary containing instruction data
-
-        Returns:
-            Instruction: New instruction instance
-        """
-        return cls(data.get('name', ''), data.get('operands', {}))
-
-@dataclass
-class Violation:
-    """
-    Represents a pipeline scheduling rule violation.
-
-    Attributes:
-        rule_name (str): Name of the violated rule
-        cells (List[Tuple[int, int]]): Grid cells involved in violation
-        rows (List[int]): Row numbers affected by violation
-        message (str): Human-readable violation description
-    """
-    rule_name: str
-    cells: List[Tuple[int, int]]  # List of (row, col) tuples
-    rows: List[int]  # List of row numbers for instruction violations
-    message: str
-
-class Rule(ABC):
-    """
-    Abstract base class for pipeline scheduling rules.
-
-    All concrete rule implementations must inherit from this class
-    and implement the check() method.
-    """
-
-    def __init__(self, name: str, description: str, enabled: bool = True):
-        """
-        Initialize a rule instance.
-
-        Args:
-            name: Human-readable rule name
-            description: Detailed description of the rule
-            enabled: Whether the rule is active for checking
-        """
-        self.name = name
-        self.description = description
-        self.enabled = enabled
-
-    @abstractmethod
-    def check(self, grid_data: Dict[Tuple[int, int], str],
-              instructions: Dict[int, Instruction],
-              rows: int, cols: int, pipeline_count: int) -> List[Violation]:
-        """
-    Check if the rule is violated in the current pipeline schedule.
-
-    Args:
-        grid_data: Dictionary mapping (row, col) tuples to block types
-        instructions: Dictionary mapping row numbers to instructions
-        rows: Number of rows in the grid
-        cols: Number of columns in the grid
-        pipeline_count: Number of concurrent pipelines (1 or 2)
-
-    Returns:
-        List[Violation]: List of detected violations, empty if none
-    """
-        pass
-
-class UniqueBlockPerColumnRule(Rule):
-    """
-    Rule enforcing unique execution blocks per column.
-
-    Ensures that X, Y0, Y1, Y2, and Y3 blocks cannot appear more than
-    once in the same column, preventing resource conflicts.
-    """
-
-    def __init__(self, enabled: bool = True):
-        super().__init__(
-            "Unique Execution Blocks Per Column",
-            "X, Y0, Y1, Y2, and Y3 blocks cannot occupy the same column more than once",
-            enabled=enabled
-        )
-        self.restricted_blocks = {'X', 'Y0', 'Y1', 'Y2', 'Y3'}
-
-    def check(self, grid_data: Dict[Tuple[int, int], str],
-              instructions: Dict[int, Instruction],
-              rows: int, cols: int, pipeline_count: int) -> List[Violation]:
-        violations = []
-
-        # Check each column
-        for col in range(cols):
-            # Track which restricted blocks appear in this column
-            block_positions: Dict[str, List[Tuple[int, int]]] = {}
-
-            for row in range(rows):
-                cell = (row, col)
-                if cell in grid_data:
-                    block_type = grid_data[cell]
-                    if block_type in self.restricted_blocks:
-                        if block_type not in block_positions:
-                            block_positions[block_type] = []
-                        block_positions[block_type].append(cell)
-
-            # Check for duplicates
-            for block_type, positions in block_positions.items():
-                if len(positions) > 1:
-                    affected_rows = sorted(set(pos[0] for pos in positions))
-                    violations.append(Violation(
-                        rule_name=self.name,
-                        cells=positions,
-                        rows=affected_rows,
-                        message=f"Block '{block_type}' appears {len(positions)} times in column {col}"
-                    ))
-
-        return violations
-
-class PipelineStageCountPerColumnRule(Rule):
-    """
-    Rule enforcing pipeline stage count limits per column.
-
-    Ensures F, D, I, W, and C stages appear at most once per pipeline
-    in each column, respecting the number of available pipelines.
-    """
-    def __init__(self, enabled: bool = True):
-        super().__init__(
-            "Pipeline Stage Count Per Column",
-            "F, D, I, W, and C blocks may appear in a column at most once per pipeline",
-            enabled=enabled
-        )
-        self.stage_blocks = {'F', 'D', 'I', 'W', 'C'}
-
-    def check(self, grid_data: Dict[Tuple[int, int], str],
-              instructions: Dict[int, Instruction],
-              rows: int, cols: int, pipeline_count: int) -> List[Violation]:
-        violations = []
-
-        for col in range(cols):
-            # count occurrences of each stage in column
-            stage_positions: Dict[str, List[Tuple[int, int]]] = {}
-            for row in range(rows):
-                cell = (row, col)
-                if cell in grid_data:
-                    b = grid_data[cell]
-                    if b in self.stage_blocks:
-                        if b not in stage_positions:
-                            stage_positions[b] = []
-                        stage_positions[b].append(cell)
-
-            for stage, positions in stage_positions.items():
-                if len(positions) > pipeline_count:
-                    affected_rows = sorted(set(pos[0] for pos in positions))
-                    violations.append(Violation(
-                        rule_name=self.name,
-                        cells=positions,
-                        rows=affected_rows,
-                        message=f"Stage '{stage}' appears {len(positions)} times in column {col} (max {pipeline_count})"
-                    ))
-        return violations
-
-class RuleChecker:
-    """
-    Manages and executes all pipeline scheduling rules.
-
-    Coordinates rule checking, maintains rule state, and provides
-    an interface for enabling/disabling rules.
-    """
-
-    def __init__(self):
-        self.rules: List[Rule] = []
-        self._register_default_rules()
-
-    def _register_default_rules(self):
-        """Register the default set of pipeline rules."""
-        self.add_rule(UniqueBlockPerColumnRule(enabled=True))
-        self.add_rule(PipelineStageCountPerColumnRule(enabled=True))
-
-    def add_rule(self, rule: Rule):
-        """
-        Add a rule to the checker.
-
-        Args:
-            rule: Rule instance to add
-        """
-        self.rules.append(rule)
-
-    def check_all(self, grid_data: Dict[Tuple[int, int], str],
-                  instructions: Dict[int, Instruction],
-                  rows: int, cols: int,
-                  pipeline_count: int) -> List[Violation]:
-        """
-        Check all enabled rules and return violations.
-
-        Args:
-            grid_data: Dictionary mapping (row, col) tuples to block types
-            instructions: Dictionary mapping row numbers to instructions
-            rows: Number of rows in the grid
-            cols: Number of columns in the grid
-            pipeline_count: Number of concurrent pipelines
-
-        Returns:
-            List[Violation]: All detected violations across all enabled rules
-        """
-        all_violations = []
-        for rule in self.rules:
-            if not getattr(rule, 'enabled', True):
-                continue
-            violations = rule.check(grid_data, instructions, rows, cols, pipeline_count)
-            all_violations.extend(violations)
-        return all_violations
-
-    def get_rules_info(self) -> List[Dict]:
-        """
-        Get information about all registered rules.
-
-        Returns:
-            List[Dict]: List of dictionaries containing rule name, description, and enabled status
-        """
-        return [
-            {
-                'name': rule.name,
-                'description': rule.description,
-                'enabled': getattr(rule, 'enabled', True)
-            }
-            for rule in self.rules
-        ]
-
-    def set_rule_enabled(self, rule_name: str, enabled: bool) -> bool:
-        """
-        Enable or disable a specific rule by name.
-
-        Args:
-            rule_name: Name of the rule to modify
-            enabled: Whether to enable (True) or disable (False) the rule
-
-        Returns:
-            bool: True if rule was found and updated, False otherwise
-        """
-        for rule in self.rules:
-            if rule.name == rule_name:
-                rule.enabled = enabled
-                return True
-        return False
-
-    def set_all_enabled(self, enabled: bool):
-        """
-        Enable or disable all rules.
-
-        Args:
-            enabled: Whether to enable (True) or disable (False) all rules
-        """
-        for rule in self.rules:
-            rule.enabled = enabled
-
-class PipelineScheduler:
-    """
-    Main controller for the CPU instruction pipeline scheduler.
-
-    Manages the grid state, instructions, pipeline configuration,
-    and coordinates rule checking. Provides the interface between
-    the web frontend and the scheduling logic.
-    """
-    def __init__(self):
-        self.grid_data = {}
-        self.instructions = {}
-        self.rows = 10
-        self.cols = 10
-        self.pipeline_count = 1  # default: 1 pipeline
-        self.rule_checker = RuleChecker()
-
-    def set_block(self, row, col, block_type):
-        """
-        Set or clear a block in the grid.
-
-        Args:
-            row: Row index
-            col: Column index
-            block_type: Block type string (e.g., 'F', 'D') or None to clear
-        """
-        if block_type:
-            self.grid_data[(row, col)] = block_type
-        elif (row, col) in self.grid_data:
-            del self.grid_data[(row, col)]
-
-    def set_instruction(self, row: int, instruction: Instruction):
-        """
-        Assign an instruction to a specific row.
-
-        Args:
-            row: Row index
-            instruction: Instruction instance to assign
-        """
-        self.instructions[row] = instruction
-
-    def get_instruction(self, row: int) -> Optional[Instruction]:
-        """
-        Retrieve the instruction assigned to a row.
-
-        Args:
-            row: Row index
-
-        Returns:
-            Optional[Instruction]: The instruction if one exists, None otherwise
-        """
-        return self.instructions.get(row)
-
-    def resize_grid(self, rows, cols):
-        """
-        Resize the scheduling grid.
-
-        Args:
-            rows: New number of rows
-            cols: New number of columns
-        """
-        self.rows = rows
-        self.cols = cols
-
-    def set_pipeline_count(self, count: int):
-        """
-        Set the number of concurrent pipelines.
-
-        Args:
-            count: Number of pipelines (must be 1 or 2)
-        """
-        if count in (1, 2):
-            self.pipeline_count = count
-
-    def check_rules(self) -> List[Dict]:
-        """
-        Check all rules and return violations in JSON-serializable format.
-
-        Returns:
-            List[Dict]: List of violation dictionaries with rule_name, cells, rows, and message
-        """
-        violations = self.rule_checker.check_all(
-            self.grid_data,
-            self.instructions,
-            self.rows,
-            self.cols,
-            self.pipeline_count
-        )
-
-        return [
-            {
-                'rule_name': v.rule_name,
-                'cells': [{'row': cell[0], 'col': cell[1]} for cell in v.cells],
-                'rows': v.rows,
-                'message': v.message
-            }
-            for v in violations
-        ]
-
-    def get_rules_info(self) -> List[Dict]:
-        """
-        Get information about all registered rules.
-
-        Returns:
-            List[Dict]: List of rule information dictionaries
-        """
-        return self.rule_checker.get_rules_info()
-
-    def get_state(self):
-        """
-        Get the complete scheduler state in JSON-serializable format.
-
-        Returns:
-            dict: State dictionary containing grid_data, instructions, dimensions,
-                  pipeline_count, and rules
-        """
-        return {
-            'grid_data': {f"{k[0]},{k[1]}": v for k, v in self.grid_data.items()},
-            'instructions': {str(k): v.to_dict() for k, v in self.instructions.items()},
-            'rows': self.rows,
-            'cols': self.cols,
-            'pipeline_count': self.pipeline_count,
-            'rules': self.get_rules_info()
-        }
-
-    def load_state(self, state):
-        """
-        Load scheduler state from a dictionary.
-
-        Args:
-            state: State dictionary (typically from JSON)
-        """
-        self.grid_data = {tuple(map(int, k.split(','))): v for k, v in state.get('grid_data', {}).items()}
-        self.instructions = {int(k): Instruction.from_dict(v) for k, v in state.get('instructions', {}).items()}
-        self.rows = state.get('rows', 10)
-        self.cols = state.get('cols', 10)
-        self.pipeline_count = state.get('pipeline_count', self.pipeline_count)
-
 scheduler = PipelineScheduler()
 
 @app.route('/')
@@ -535,7 +34,8 @@ def index():
     return render_template('index.html',
                            instruction_formats=instruction_formats,
                            rules_info=rules_info,
-                           pipeline_count=scheduler.pipeline_count)
+                           pipeline_count=scheduler.pipeline_count,
+                           pipeline_types=PipelineScheduler.get_pipeline_types())  # NEW
 
 @app.route('/api/state', methods=['GET'])
 def get_state():
@@ -867,6 +367,124 @@ def get_pipeline_count():
         }
     """
     return jsonify({'pipeline_count': scheduler.pipeline_count})
+
+@app.route('/api/pipeline-types', methods=['GET'])
+def get_pipeline_types():
+    """
+    Retrieve all available pipeline annotation types.
+
+    Returns:
+        JSON response:
+            pipeline_types (list): Each entry has name, color, description
+    """
+    return jsonify({'pipeline_types': PipelineScheduler.get_pipeline_types()})
+
+
+@app.route('/api/pipeline-annotations', methods=['GET'])
+def get_pipeline_annotations():
+    """
+    Retrieve all currently stored pipeline annotations.
+
+    Returns:
+        JSON response:
+            annotations (list): Each entry has annotation_type, color, source, target
+    """
+    return jsonify({'annotations': scheduler.get_pipeline_annotations()})
+
+
+@app.route('/api/pipeline-annotations', methods=['POST'])
+def add_pipeline_annotation():
+    """
+    Add a new pipeline annotation between two grid cells.
+
+    Request Body (JSON):
+        annotation_type (str): Name of the pipeline type (e.g., 'RAW')
+        source (dict): {"row": int, "col": int} – origin cell
+        target (dict): {"row": int, "col": int} – destination cell
+
+    Returns:
+        JSON response:
+            success (bool): True
+            annotation (dict): The newly created annotation
+    """
+    data = request.json
+    source = (int(data['source']['row']), int(data['source']['col']))
+    target = (int(data['target']['row']), int(data['target']['col']))
+    annotation = scheduler.add_pipeline_annotation(data['annotation_type'], source, target)
+    return jsonify({'success': True, 'annotation': annotation.to_dict()})
+
+
+@app.route('/api/pipeline-annotations', methods=['DELETE'])
+def remove_pipeline_annotation():
+    """
+    Remove pipeline annotation(s) from the schedule.
+
+    Supports two removal modes depending on the request body:
+
+    Mode 1 – Specific annotation (used by the annotation list delete button):
+        Provide source, target, and annotation_type to remove exactly one entry.
+
+    Mode 2 – Cell-based removal (used by right-click on a grid cell):
+        Provide row and col to remove all annotations involving that cell.
+
+    Request Body (JSON) – Mode 1:
+        source (dict):          {"row": int, "col": int}
+        target (dict):          {"row": int, "col": int}
+        annotation_type (str):  Optional; narrows match to one type
+
+    Request Body (JSON) – Mode 2:
+        row (int): Row index of the cell
+        col (int): Column index of the cell
+
+    Returns:
+        JSON response:
+            success (bool): True
+            removed (int):  Number of annotations deleted
+    """
+    data = request.json
+
+    if 'source' in data and 'target' in data:
+        source = (int(data['source']['row']), int(data['source']['col']))
+        target = (int(data['target']['row']), int(data['target']['col']))
+        annotation_type = data.get('annotation_type')
+        removed = scheduler.remove_specific_pipeline_annotation(source, target, annotation_type)
+    else:
+        removed = scheduler.remove_pipeline_annotations_at(
+            int(data['row']), int(data['col'])
+        )
+
+    return jsonify({'success': True, 'removed': removed})
+
+def remove_specific_pipeline_annotation(
+        self,
+        source: Tuple[int, int],
+        target: Tuple[int, int],
+        annotation_type: str = None) -> int:
+    """
+    Remove a single annotation matching source, target, and optionally type.
+
+    More precise than remove_pipeline_annotations_at; used when deleting
+    from the annotation list panel where each item is individually identified.
+
+    Args:
+        source:          (row, col) of the origin cell
+        target:          (row, col) of the destination cell
+        annotation_type: If provided, must also match; allows two annotations
+                         with the same endpoints but different types to coexist
+
+    Returns:
+        int: Number of annotations removed (0 or 1 under normal usage)
+    """
+    before = len(self.pipeline_annotations)
+    self.pipeline_annotations = [
+        a for a in self.pipeline_annotations
+        if not (
+            a.source == source and
+            a.target == target and
+            (annotation_type is None or a.annotation_type == annotation_type)
+        )
+    ]
+    return before - len(self.pipeline_annotations)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
