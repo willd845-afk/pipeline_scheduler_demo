@@ -1,0 +1,133 @@
+meta:
+  name: "Default Pipeline Configuration"
+  description: "Baseline configuration for teaching pipelining concepts"
+
+# --------------------------------------------------
+# Instruction Set Definition
+# --------------------------------------------------
+instructions:
+  add:
+    type: R_TYPE
+    operands: [rd, rs1, rs2]
+    format: "add rd, rs1, rs2"
+
+  addi:
+    type: I_TYPE
+    operands: [rd, rs1, imm]
+    format: "addi rd, rs1, imm"
+
+  mul:
+    type: R_TYPE
+    operands: [rd, rs1, rs2]
+    format: "mul rd, rs1, rs2"
+
+  bne:
+    type: B_TYPE
+    operands: [rs1, rs2, imm]
+    format: "bne rs1, rs2, imm"
+
+  jr:
+    type: JR_TYPE
+    operands: [rs1]
+    format: "jr rs1"
+
+  lw:
+    type: I_TYPE
+    operands: [rd, rs1, imm]
+    format: "lw rd, imm(rs1)"
+
+  sw:
+    type: I_STORE
+    operands: [rs2, rs1, imm]
+    format: "sw rs2, imm(rs1)"
+
+  jal:
+    type: J_TYPE
+    operands: [rd, imm]
+    format: "jal rd, imm"
+
+# --------------------------------------------------
+# Hazard / Bypass Types
+# --------------------------------------------------
+bypass_types:
+  - name: RAW
+    color: "#cc0000"
+    description: "Read After Write"
+
+  - name: WAR
+    color: "#cc6600"
+    description: "Write After Read"
+
+  - name: WAW
+    color: "#9900cc"
+    description: "Write After Write"
+
+  - name: Control
+    color: "#006600"
+    description: "Control Dependency"
+
+  - name: Structural
+    color: "#0066cc"
+    description: "Structural Hazard"
+
+# --------------------------------------------------
+# Pipeline Stages
+# capacity: max instructions allowed (0 = unlimited)
+# --------------------------------------------------
+pipeline:
+  stages:
+    F: 1
+    D: 1
+    i: 0
+    I: 1
+    Y0: 1
+    Y1: 1
+    Y2: 1
+    Y3: 1
+    W: 1
+    r: 0
+    C: 1
+    X: 1
+
+# --------------------------------------------------
+# Default Simulation State (optional starting point)
+# --------------------------------------------------
+defaults:
+  rows: 10
+  cols: 10
+
+# --------------------------------------------------
+# Rules System
+# --------------------------------------------------
+rules:
+
+  - name: "Unique Stage Per Column"
+    description: >
+      Ensures that each pipeline stage appears at most once per column,
+      unless the stage capacity is set to 0 (unbounded).
+      This models structural limits of pipeline hardware.
+
+    enabled: true
+
+    type: "column_constraint"
+
+    logic:
+      scope: "column"
+
+      # What we are checking
+      target: "grid_data"
+
+      # Rule definition (designed to be interpretable, not code)
+      constraint:
+        group_by: "stage"
+
+        limit:
+          from: "pipeline.stages"   # look up capacity from config
+          key: "stage"
+
+        ignore_if:
+          capacity_equals: 0
+
+        violation_message: >
+          Stage '{stage}' exceeds its allowed capacity ({capacity})
+          in column {col}.

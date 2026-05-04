@@ -1,490 +1,405 @@
-# app.py
+"""
+app.py
+
+Flask application entry point and all route definitions for the CPU
+Instruction Pipeline Scheduler.
+
+A single PipelineScheduler instance is created at startup using the config
+loaded from project_root/config/config.yaml.  All route handlers delegate
+to scheduler methods and contain no scheduling or rule-checking logic.
+
+pipeline_count and its related routes (/api/pipeline-count) have been
+removed.  Stage capacities are now defined per-stage in the YAML config.
+"""
+
 from flask import Flask, render_template, jsonify, request
-from pipeline import Instruction, PipelineScheduler
+
+from pipeline            import Instruction, PipelineScheduler
+from pipeline.config     import PipelineConfig
 
 app = Flask(__name__)
-scheduler = PipelineScheduler()
+
+# ---------------------------------------------------------------------------
+# Application startup — load config and create scheduler
+# ---------------------------------------------------------------------------
+
+_default_config = PipelineConfig.load_from_file()
+scheduler       = PipelineScheduler(config=_default_config)
+
+
+# ---------------------------------------------------------------------------
+# Page
+# ---------------------------------------------------------------------------
 
 @app.route('/')
 def index():
     """
     Render the main application interface.
 
-    Serves the primary HTML template with instruction format definitions,
-    current rules information, and pipeline count injected for client-side use.
+    Injects instruction format definitions, bypass annotation types, and
+    ordered block types into the template so they are available to the
+    frontend via window.FLASK_DATA without requiring a separate API call.
 
-    Template Variables:
-        instruction_formats (dict): Maps instruction names to their format specifications
-                                   (type, operands, syntax)
-        rules_info (list): List of dictionaries containing rule name, description,
-                          and enabled status
-        pipeline_count (int): Current number of pipelines (1 or 2)
+    Template variables:
+        instruction_formats (dict): Maps instruction mnemonics to their
+                                    format spec (type, operands, syntax)
+        bypass_types (list):        Bypass annotation type dicts
+                                    (name, color, description)
+        block_types  (list):        Ordered stage name strings for the
+                                    block palette, e.g. ['F','D','I',...]
 
     Returns:
-        str: Rendered HTML template
+        str: Rendered HTML template (templates/index.html)
     """
-    instruction_formats = {name: {
-        'type': fmt.instruction_type.value,
-        'operands': fmt.operands,
-        'syntax': fmt.syntax
-    } for name, fmt in Instruction.FORMATS.items()}
+    return render_template(
+        'index.html',
+        instruction_formats = scheduler.config.to_instruction_formats(),
+        bypass_types        = scheduler.get_bypass_types(),
+        block_types         = scheduler.config.to_block_types(),
+    )
 
-    rules_info = scheduler.get_rules_info()
 
-    return render_template('index.html',
-                           instruction_formats=instruction_formats,
-                           rules_info=rules_info,
-                           pipeline_count=scheduler.pipeline_count,
-                           pipeline_types=PipelineScheduler.get_pipeline_types())  # NEW
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 @app.route('/api/state', methods=['GET'])
 def get_state():
     """
     Retrieve the complete scheduler state.
 
-    Returns the current state of the pipeline scheduler including grid data,
-    instructions, dimensions, pipeline count, and rules configuration.
-    Used for state persistence and UI synchronization.
-
     Returns:
         JSON response containing:
-            grid_data (dict): Maps "row,col" keys to block types
-            instructions (dict): Maps row numbers (as strings) to instruction objects
-            rows (int): Current number of rows
-            cols (int): Current number of columns
-            pipeline_count (int): Number of pipelines (1 or 2)
-            rules (list): List of rule information dictionaries
-
-    Example Response:
-        {
-            "grid_data": {"0,0": "F", "0,1": "D"},
-            "instructions": {"0": {"name": "add", "operands": {"rd": "r1", "rs1": "r2", "rs2": "r3"}}},
-            "rows": 10,
-            "cols": 10,
-            "pipeline_count": 1,
-            "rules": [{"name": "...", "description": "...", "enabled": true}]
-        }
+            grid_data           (dict):  Maps "row,col" keys to block types
+            instructions        (dict):  Maps row numbers to instruction dicts
+            rows                (int):   Current number of rows
+            cols                (int):   Current number of columns
+            config_name         (str):   Name field from the loaded config
+            rules               (list):  Rule info dicts
+            bypass_annotations  (list):  Annotation dicts
     """
     return jsonify(scheduler.get_state())
+
 
 @app.route('/api/state', methods=['POST'])
 def update_state():
     """
-    Update the complete scheduler state from a saved configuration.
+    Overwrite the complete scheduler state.
 
-    Accepts a full state object (typically from a saved JSON file) and
-    restores the scheduler to that state. This includes grid data, instructions,
-    dimensions, pipeline count, and rule configurations.
+    Accepts the same structure as GET /api/state.  If a 'rules' key is
+    present, the enabled state of each named rule is also updated.
 
-    Request Body (JSON):
-        grid_data (dict, optional): Grid cell mappings
-        instructions (dict, optional): Instruction configurations per row
-        rows (int, optional): Number of rows
-        cols (int, optional): Number of columns
-        pipeline_count (int, optional): Number of pipelines
-        rules (list, optional): Rule configurations with enabled states
+    Request body (JSON): Same structure as GET /api/state response.
 
     Returns:
-        JSON response:
-            success (bool): True if state was loaded successfully
-
-    Example Request:
-        {
-            "grid_data": {"0,0": "F"},
-            "instructions": {"0": {"name": "add", "operands": {...}}},
-            "rows": 10,
-            "cols": 10,
-            "pipeline_count": 2,
-            "rules": [{"name": "...", "enabled": true}]
-        }
+        JSON: {"success": true}
     """
     data = request.json
     scheduler.load_state(data)
-    # also update rule enabled states if provided
     if 'rules' in data:
         for r in data['rules']:
-            scheduler.rule_checker.set_rule_enabled(r.get('name'), r.get('enabled', True))
-    if 'pipeline_count' in data:
-        scheduler.set_pipeline_count(int(data['pipeline_count']))
+            scheduler.rule_checker.set_rule_enabled(
+                r.get('name'), r.get('enabled', True)
+            )
     return jsonify({'success': True})
+
+
+# ---------------------------------------------------------------------------
+# Grid
+# ---------------------------------------------------------------------------
 
 @app.route('/api/block', methods=['POST'])
 def set_block():
     """
-    Set or clear a block in a specific grid cell.
+    Place or clear a block in a specific grid cell.
 
-    Places a pipeline stage block (F, D, I, X, Y0-Y3, W, r, C) at the specified
-    grid coordinates, or clears the cell if block_type is null/None.
-
-    Request Body (JSON):
-        row (int): Row index (0-based)
-        col (int): Column index (0-based)
-        block_type (str|null): Block type identifier or null to clear
+    Request body (JSON):
+        row        (int):      Row index (0-based)
+        col        (int):      Column index (0-based)
+        block_type (str|null): Block type string or null to clear the cell
 
     Returns:
-        JSON response:
-            success (bool): True if operation completed
-
-    Example Request:
-        {
-            "row": 0,
-            "col": 5,
-            "block_type": "F"
-        }
+        JSON: {"success": true}
     """
-    data = request.json
-    row = int(data['row'])
-    col = int(data['col'])
+    data       = request.json
+    row        = int(data['row'])
+    col        = int(data['col'])
     block_type = data.get('block_type')
     scheduler.set_block(row, col, block_type)
     return jsonify({'success': True})
+
+
+@app.route('/api/resize', methods=['POST'])
+def resize():
+    """
+    Resize the scheduling grid.
+
+    Blocks outside the new bounds are preserved internally and reappear
+    if the grid is later enlarged again.
+
+    Request body (JSON):
+        rows (int): New number of rows (0–100)
+        cols (int): New number of columns (0–100)
+
+    Returns:
+        JSON: {"success": true}
+    """
+    data = request.json
+    scheduler.resize_grid(int(data['rows']), int(data['cols']))
+    return jsonify({'success': True})
+
+
+# ---------------------------------------------------------------------------
+# Instructions
+# ---------------------------------------------------------------------------
 
 @app.route('/api/instruction', methods=['POST'])
 def set_instruction():
     """
     Set or update an instruction for a specific row.
 
-    Configures the instruction type and operands for a given row in the
-    pipeline schedule. Each row represents one instruction in the schedule.
+    Pass {"name": "", "operands": {}} to clear a row's instruction.
 
-    Request Body (JSON):
-        row (int): Row index (0-based)
-        instruction (object): Instruction configuration
-            name (str): Instruction mnemonic (e.g., 'add', 'lw', 'bne')
-            operands (dict): Maps operand names to values
-                            (e.g., {"rd": "r1", "rs1": "r2", "rs2": "r3"})
+    Request body (JSON):
+        row         (int):  Row index (0-based)
+        instruction (dict): {"name": str, "operands": {operand: value, ...}}
 
     Returns:
-        JSON response:
-            success (bool): True if operation completed
-
-    Example Request:
-        {
-            "row": 0,
-            "instruction": {
-                "name": "add",
-                "operands": {
-                    "rd": "r1",
-                    "rs1": "r2",
-                    "rs2": "r3"
-                }
-            }
-        }
+        JSON: {"success": true}
     """
-    data = request.json
-    row = int(data['row'])
+    data        = request.json
+    row         = int(data['row'])
     instruction = Instruction.from_dict(data['instruction'])
     scheduler.set_instruction(row, instruction)
     return jsonify({'success': True})
 
-@app.route('/api/resize', methods=['POST'])
-def resize():
-    """
-    Resize the scheduling grid dimensions.
 
-    Changes the number of rows and/or columns in the pipeline grid.
-    Existing blocks outside the new dimensions are preserved in the
-    internal state but won't be visible until the grid is enlarged again.
-
-    Request Body (JSON):
-        rows (int): New number of rows (0-100)
-        cols (int): New number of columns (0-100)
-
-    Returns:
-        JSON response:
-            success (bool): True if operation completed
-
-    Example Request:
-        {
-            "rows": 15,
-            "cols": 20
-        }
-    """
-    data = request.json
-    rows = int(data['rows'])
-    cols = int(data['cols'])
-    scheduler.resize_grid(rows, cols)
-    return jsonify({'success': True})
+# ---------------------------------------------------------------------------
+# Rules
+# ---------------------------------------------------------------------------
 
 @app.route('/api/check-rules', methods=['GET'])
 def check_rules():
     """
-    Check all enabled rules and return violations.
-
-    Evaluates the current pipeline schedule against all enabled rules
-    and returns detailed information about any violations, including
-    which cells and rows are affected.
+    Evaluate all enabled rules against the current grid state.
 
     Returns:
-        JSON response containing:
-            violations (list): List of violation objects, each containing:
-                rule_name (str): Name of the violated rule
-                cells (list): List of {"row": int, "col": int} objects
-                rows (list): List of affected row numbers
-                message (str): Human-readable violation description
-
-    Example Response:
-        {
+        JSON: {
             "violations": [
                 {
-                    "rule_name": "Unique Execution Blocks Per Column",
-                    "cells": [{"row": 0, "col": 5}, {"row": 1, "col": 5}],
-                    "rows": [0, 1],
-                    "message": "Block 'X' appears 2 times in column 5"
-                }
+                    "rule_name": str,
+                    "cells":     [{"row": int, "col": int}, ...],
+                    "rows":      [int, ...],
+                    "message":   str
+                },
+                ...
             ]
         }
+        violations is an empty list when the schedule is valid.
     """
-    violations = scheduler.check_rules()
-    return jsonify({'violations': violations})
+    return jsonify({'violations': scheduler.check_rules()})
+
 
 @app.route('/api/rules', methods=['GET'])
 def get_rules():
     """
-    Retrieve information about all registered rules.
-
-    Returns metadata for all pipeline scheduling rules, including
-    their names, descriptions, and current enabled/disabled status.
+    List all registered rules and their current enabled state.
 
     Returns:
-        JSON response containing:
-            rules (list): List of rule objects, each containing:
-                name (str): Rule name
-                description (str): Detailed rule description
-                enabled (bool): Whether rule is currently active
-
-    Example Response:
-        {
+        JSON: {
             "rules": [
-                {
-                    "name": "Unique Execution Blocks Per Column",
-                    "description": "X, Y0, Y1, Y2, and Y3 blocks cannot occupy...",
-                    "enabled": true
-                },
-                {
-                    "name": "Pipeline Stage Count Per Column",
-                    "description": "F, D, I, W, and C blocks may appear...",
-                    "enabled": true
-                }
+                {"name": str, "description": str, "enabled": bool},
+                ...
             ]
         }
     """
-    rules_info = scheduler.get_rules_info()
-    return jsonify({'rules': rules_info})
+    return jsonify({'rules': scheduler.get_rules_info()})
+
 
 @app.route('/api/rules', methods=['POST'])
 def update_rules():
     """
     Enable or disable pipeline rules.
 
-    Allows toggling individual rules or all rules at once. When rules are
-    disabled, they won't be checked during validation, allowing users to
-    temporarily bypass specific constraints.
+    Request body — single rule:
+        {"name": str, "enabled": bool}
 
-    Request Body (JSON) - Option 1 (single rule):
-        name (str): Name of the rule to modify
-        enabled (bool): Whether to enable or disable the rule
-
-    Request Body (JSON) - Option 2 (all rules):
-        all (bool): Enable (true) or disable (false) all rules
+    Request body — all rules at once:
+        {"all": bool}
 
     Returns:
-        JSON response:
-            success (bool): True if operation completed successfully
-            error (str, optional): Error message if request was invalid
-
-    Example Request 1 (single rule):
-        {
-            "name": "Unique Execution Blocks Per Column",
-            "enabled": false
-        }
-
-    Example Request 2 (all rules):
-        {
-            "all": true
-        }
+        JSON: {"success": bool}
+        HTTP 400 with {"success": false} if the body matches neither format.
     """
     data = request.json
-    # Expect either {name: ..., enabled: true} or {"all": true/false}
     if 'all' in data:
-        enabled = bool(data['all'])
-        scheduler.rule_checker.set_all_enabled(enabled)
+        scheduler.rule_checker.set_all_enabled(bool(data['all']))
         return jsonify({'success': True})
     if 'name' in data and 'enabled' in data:
-        name = data['name']
-        enabled = bool(data['enabled'])
-        ok = scheduler.rule_checker.set_rule_enabled(name, enabled)
+        ok = scheduler.rule_checker.set_rule_enabled(
+            data['name'], bool(data['enabled'])
+        )
         return jsonify({'success': ok})
     return jsonify({'success': False}), 400
 
-@app.route('/api/pipeline-count', methods=['POST'])
-def set_pipeline_count():
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+@app.route('/api/config', methods=['GET'])
+def get_config():
     """
-    Set the number of concurrent pipelines.
-
-    Configures whether the scheduler uses 1 or 2 pipelines. This affects
-    how many times certain pipeline stages (F, D, I, W, C) can appear in
-    the same column, as enforced by the PipelineStageCountPerColumnRule.
-
-    Request Body (JSON):
-        pipeline_count (int): Number of pipelines (must be 1 or 2)
+    Return the currently loaded configuration as JSON.
 
     Returns:
-        JSON response:
-            success (bool): True if operation completed
-            error (str, optional): Error message if invalid count provided
+        JSON: Full config dict from PipelineConfig.to_dict():
+              meta, instruction_formats, bypass_types, stage_capacities,
+              block_types, rule_definitions, defaults.
+    """
+    return jsonify(scheduler.config.to_dict())
 
-    Status Codes:
-        200: Success
-        400: Invalid pipeline count (not 1 or 2)
 
-    Example Request:
-        {
-            "pipeline_count": 2
+@app.route('/api/config', methods=['POST'])
+def upload_config():
+    """
+    Accept a .yaml file upload, validate it, and apply it to the scheduler.
+
+    Accepts multipart/form-data with a 'config' file field containing a
+    YAML file.  Validation errors are returned as a list in the response
+    body rather than raising an exception, so the frontend can display them.
+
+    On success, returns the full config dict (same shape as GET /api/config)
+    plus a 'success' key so the frontend can update all data structures
+    (block types, instruction formats, bypass types) in a single round trip.
+
+    Returns:
+        JSON: config dict + {"success": true}                  HTTP 200
+        JSON: {"success": false, "errors": [str, ...]}         HTTP 400
+    """
+    if 'config' not in request.files:
+        return jsonify({'success': False, 'errors': ['No file provided']}), 400
+
+    try:
+        config = PipelineConfig.load_from_stream(request.files['config'])
+    except Exception as exc:
+        return jsonify(
+            {'success': False, 'errors': [f'YAML parse error: {exc}']}
+        ), 400
+
+    errors = config.validate()
+    if errors:
+        return jsonify({'success': False, 'errors': errors}), 400
+
+    scheduler.load_config(config)
+
+    response_data            = config.to_dict()
+    response_data['success'] = True
+    return jsonify(response_data)
+
+
+# ---------------------------------------------------------------------------
+# Bypass types
+# ---------------------------------------------------------------------------
+
+@app.route('/api/bypass-types', methods=['GET'])
+def get_bypass_types():
+    """
+    Retrieve all available bypass annotation types from the loaded config.
+
+    Returns:
+        JSON: {
+            "bypass_types": [
+                {"name": str, "color": str, "description": str},
+                ...
+            ]
         }
     """
-    data = request.json
-    count = int(data.get('pipeline_count', 1))
-    if count not in (1, 2):
-        return jsonify({'success': False, 'error': 'pipeline_count must be 1 or 2'}), 400
-    scheduler.set_pipeline_count(count)
-    return jsonify({'success': True})
+    return jsonify({'bypass_types': scheduler.get_bypass_types()})
 
-@app.route('/api/pipeline-count', methods=['GET'])
-def get_pipeline_count():
+
+# ---------------------------------------------------------------------------
+# Bypass annotations
+# ---------------------------------------------------------------------------
+
+@app.route('/api/bypass-annotations', methods=['GET'])
+def get_bypass_annotations():
     """
-    Retrieve the current number of pipelines.
-
-    Returns the currently configured pipeline count (1 or 2).
+    Retrieve all currently stored bypass annotations.
 
     Returns:
-        JSON response:
-            pipeline_count (int): Current number of pipelines
-
-    Example Response:
-        {
-            "pipeline_count": 1
+        JSON: {
+            "annotations": [
+                {
+                    "annotation_type": str,
+                    "color":           str,
+                    "source":          {"row": int, "col": int},
+                    "target":          {"row": int, "col": int}
+                },
+                ...
+            ]
         }
     """
-    return jsonify({'pipeline_count': scheduler.pipeline_count})
+    return jsonify({'annotations': scheduler.get_bypass_annotations()})
 
-@app.route('/api/pipeline-types', methods=['GET'])
-def get_pipeline_types():
+
+@app.route('/api/bypass-annotations', methods=['POST'])
+def add_bypass_annotation():
     """
-    Retrieve all available pipeline annotation types.
+    Add a new bypass annotation connecting two grid cells.
+
+    annotation_type must match a name from GET /api/bypass-types.
+
+    Request body (JSON):
+        annotation_type (str):  Name of the bypass type (e.g. 'RAW')
+        source          (dict): {"row": int, "col": int}
+        target          (dict): {"row": int, "col": int}
 
     Returns:
-        JSON response:
-            pipeline_types (list): Each entry has name, color, description
+        JSON: {"success": true, "annotation": {annotation_type, color,
+               source, target}}
     """
-    return jsonify({'pipeline_types': PipelineScheduler.get_pipeline_types()})
-
-
-@app.route('/api/pipeline-annotations', methods=['GET'])
-def get_pipeline_annotations():
-    """
-    Retrieve all currently stored pipeline annotations.
-
-    Returns:
-        JSON response:
-            annotations (list): Each entry has annotation_type, color, source, target
-    """
-    return jsonify({'annotations': scheduler.get_pipeline_annotations()})
-
-
-@app.route('/api/pipeline-annotations', methods=['POST'])
-def add_pipeline_annotation():
-    """
-    Add a new pipeline annotation between two grid cells.
-
-    Request Body (JSON):
-        annotation_type (str): Name of the pipeline type (e.g., 'RAW')
-        source (dict): {"row": int, "col": int} – origin cell
-        target (dict): {"row": int, "col": int} – destination cell
-
-    Returns:
-        JSON response:
-            success (bool): True
-            annotation (dict): The newly created annotation
-    """
-    data = request.json
+    data   = request.json
     source = (int(data['source']['row']), int(data['source']['col']))
     target = (int(data['target']['row']), int(data['target']['col']))
-    annotation = scheduler.add_pipeline_annotation(data['annotation_type'], source, target)
+    annotation = scheduler.add_bypass_annotation(
+        data['annotation_type'], source, target
+    )
     return jsonify({'success': True, 'annotation': annotation.to_dict()})
 
 
-@app.route('/api/pipeline-annotations', methods=['DELETE'])
-def remove_pipeline_annotation():
+@app.route('/api/bypass-annotations', methods=['DELETE'])
+def remove_bypass_annotation():
     """
-    Remove pipeline annotation(s) from the schedule.
+    Remove bypass annotation(s).
 
-    Supports two removal modes depending on the request body:
+    Mode 1 — specific annotation (used by the annotation list delete button):
+        Request body: {
+            "source":          {"row": int, "col": int},
+            "target":          {"row": int, "col": int},
+            "annotation_type": str   (optional; narrows to one type)
+        }
 
-    Mode 1 – Specific annotation (used by the annotation list delete button):
-        Provide source, target, and annotation_type to remove exactly one entry.
-
-    Mode 2 – Cell-based removal (used by right-click on a grid cell):
-        Provide row and col to remove all annotations involving that cell.
-
-    Request Body (JSON) – Mode 1:
-        source (dict):          {"row": int, "col": int}
-        target (dict):          {"row": int, "col": int}
-        annotation_type (str):  Optional; narrows match to one type
-
-    Request Body (JSON) – Mode 2:
-        row (int): Row index of the cell
-        col (int): Column index of the cell
+    Mode 2 — all annotations touching a cell (used by right-click on grid):
+        Request body: {"row": int, "col": int}
 
     Returns:
-        JSON response:
-            success (bool): True
-            removed (int):  Number of annotations deleted
+        JSON: {"success": true, "removed": int}
+              removed is the count of annotations deleted.
     """
     data = request.json
-
     if 'source' in data and 'target' in data:
         source = (int(data['source']['row']), int(data['source']['col']))
         target = (int(data['target']['row']), int(data['target']['col']))
-        annotation_type = data.get('annotation_type')
-        removed = scheduler.remove_specific_pipeline_annotation(source, target, annotation_type)
+        removed = scheduler.remove_specific_bypass_annotation(
+            source, target, data.get('annotation_type')
+        )
     else:
-        removed = scheduler.remove_pipeline_annotations_at(
+        removed = scheduler.remove_bypass_annotations_at(
             int(data['row']), int(data['col'])
         )
-
     return jsonify({'success': True, 'removed': removed})
 
-def remove_specific_pipeline_annotation(
-        self,
-        source: Tuple[int, int],
-        target: Tuple[int, int],
-        annotation_type: str = None) -> int:
-    """
-    Remove a single annotation matching source, target, and optionally type.
-
-    More precise than remove_pipeline_annotations_at; used when deleting
-    from the annotation list panel where each item is individually identified.
-
-    Args:
-        source:          (row, col) of the origin cell
-        target:          (row, col) of the destination cell
-        annotation_type: If provided, must also match; allows two annotations
-                         with the same endpoints but different types to coexist
-
-    Returns:
-        int: Number of annotations removed (0 or 1 under normal usage)
-    """
-    before = len(self.pipeline_annotations)
-    self.pipeline_annotations = [
-        a for a in self.pipeline_annotations
-        if not (
-            a.source == source and
-            a.target == target and
-            (annotation_type is None or a.annotation_type == annotation_type)
-        )
-    ]
-    return before - len(self.pipeline_annotations)
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

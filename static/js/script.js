@@ -1,29 +1,27 @@
 // ── Flask-injected data ────────────────────────────────────────────────────
-// Read from window.FLASK_DATA which was set by the inline script in index.html.
-// Keeping these separate from FLASK_DATA avoids redeclaration errors and lets
-// the rest of the file use the same short names as before.
-const INSTRUCTION_FORMATS  = window.FLASK_DATA.instructionFormats;
-const INSTRUCTION_NAMES    = Object.keys(INSTRUCTION_FORMATS);
-const PIPELINE_TYPES       = window.FLASK_DATA.pipelineTypes;
-let   currentPipelineCount = window.FLASK_DATA.pipelineCount;
+// Declared with 'let' so importConfig() can reassign them after a hot reload.
+let INSTRUCTION_FORMATS = window.FLASK_DATA.instructionFormats;
+let INSTRUCTION_NAMES   = Object.keys(INSTRUCTION_FORMATS);
+let BYPASS_TYPES        = window.FLASK_DATA.bypassTypes;   // was PIPELINE_TYPES
+let BLOCK_TYPES         = window.FLASK_DATA.blockTypes;    // was a hard-coded array
 
-// ── Static constants ───────────────────────────────────────────────────────
-const BLOCK_TYPES = ['F', 'D', 'i', 'I', 'Y0', 'Y1', 'Y2', 'Y3', 'W', 'r', 'C', 'X'];
-
+// ── Grid state ────────────────────────────────────────────────────────────
 let currentRows = 10;
 let currentCols = 10;
-let gridData = {};
+let gridData    = {};
 let instructions = {};
-let currentViolations = [];
-let rulesInfo = [];
 
-// Annotation mode state
-let pipelineAnnotationMode = false;   // true while placing annotations
-let selectedPipelineType  = null;     // the PipelineType object currently selected
-let pipelineSource        = null;     // {row, col} of the first click; null until set
-let pipelineAnnotations   = [];       // all annotations loaded from / saved to server
-let pipelineMenuOpen      = false;    // whether the type dropdown is visible
-let pipelineDragging = false; // true while the user is holding mousedown on a source cell
+// ── Rule / violation state ────────────────────────────────────────────────
+let currentViolations = [];
+let rulesInfo         = [];
+
+// ── Bypass annotation mode state ──────────────────────────────────────────
+let bypassAnnotationMode = false;
+let selectedBypassType   = null;
+let bypassSource         = null;
+let bypassAnnotations    = [];
+let bypassMenuOpen       = false;
+let bypassDragging       = false;
 
 /**
  * Convert a hex colour string to an {r, g, b} object.
@@ -67,7 +65,7 @@ function initPalette() {
 
         // Exit annotation mode when the user starts dragging a palette block
         block.addEventListener('dragstart', (e) => {
-            if (pipelineAnnotationMode) exitPipelineMode(); // NEW
+            if (bypassAnnotationMode) exitPipelineMode(); // NEW
             e.dataTransfer.setData('blockType', blockType);
             e.dataTransfer.setData('source', 'palette');
             block.classList.add('dragging');
@@ -75,32 +73,12 @@ function initPalette() {
 
         // Also exit if the user merely clicks a palette block (without dragging)
         block.addEventListener('click', () => {          // NEW
-            if (pipelineAnnotationMode) exitPipelineMode();
+            if (bypassAnnotationMode) exitPipelineMode();
         });
 
         palette.appendChild(block);
     });
 }
-
-function initPipelinePalette() {
-    const pipelineButton = document.createElement("BUTTON");
-    pipelineButton.className = 'pipeline-button';
-    pipelineButton.addEventListener('click', (e) => {
-
-        /*
-        * Clicking brings up a list of pipeline types
-        * Swap to new state where clicking adds (lmb) or removes (rmb) pipelines
-        * Have a transparent circle around the mouse
-        * Greyed out button while enabled
-        * Mode is disabled when palette block is clicked
-        */
-
-    })
-
-
-    pipelineButton
-}
-
 /**
  * Load rules information from the server and populate the rules panel.
  * Fetches the current rule configuration and renders checkboxes for each rule.
@@ -183,24 +161,6 @@ async function toggleAllRules(enabled) {
 
     renderRulesPanel();
     await checkRules();
-}
-
-/**
- * Update the pipeline count based on radio button selection.
- * Sends the new count to the server and triggers rule re-checking.
- * @async
- */
-async function updatePipelineCount() {
-    const selected = document.querySelector('input[name="pipelines"]:checked');
-    if (selected) {
-        currentPipelineCount = parseInt(selected.value);
-        await fetch('/api/pipeline-count', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pipeline_count: currentPipelineCount })
-        });
-        await checkRules();
-    }
 }
 
 /**
@@ -452,7 +412,7 @@ function generateGrid() {
                 block.draggable = true;
 
                 block.addEventListener('dragstart', (e) => {
-                if (pipelineAnnotationMode) {
+                if (bypassAnnotationMode) {
                     e.preventDefault(); // Block dragging is disabled in pipeline mode
                     return;
                 }
@@ -472,7 +432,7 @@ function generateGrid() {
 
             // Drop event handlers
             cell.addEventListener('dragover', (e) => {
-            if (pipelineAnnotationMode) return; // Drops disabled in pipeline mode
+            if (bypassAnnotationMode) return; // Drops disabled in pipeline mode
             e.preventDefault();
             cell.classList.add('drag-over');
             });
@@ -482,7 +442,7 @@ function generateGrid() {
             });
 
             cell.addEventListener('drop', async (e) => {
-                if (pipelineAnnotationMode) return; // Drops disabled in pipeline mode
+                if (bypassAnnotationMode) return; // Drops disabled in pipeline mode
                 e.preventDefault();
                 cell.classList.remove('drag-over');
 
@@ -504,20 +464,20 @@ function generateGrid() {
                 await checkRules();
             });
 
-            // MODIFIED: Check pipeline mode before the existing block-removal logic
+            // MODIFIED: Check bypass mode before the existing block-removal logic
             cell.addEventListener('contextmenu', async (e) => {
                 e.preventDefault();
 
                 // Cancel any in-progress drag first
-                if (pipelineDragging) {
-                    pipelineDragging = false;
-                    pipelineSource   = null;
-                    document.querySelectorAll('.grid-cell.pipeline-source')
-                            .forEach(c => c.classList.remove('pipeline-source'));
+                if (bypassDragging) {
+                    bypassDragging = false;
+                    bypassSource   = null;
+                    document.querySelectorAll('.grid-cell.bypass-source')
+                            .forEach(c => c.classList.remove('bypass-source'));
                 }
 
-                if (pipelineAnnotationMode) {
-                    await handlePipelineCellRightClick(row, col);
+                if (bypassAnnotationMode) {
+                    await handleBypassCellRightClick(row, col);
                     return;
                 }
 
@@ -531,36 +491,36 @@ function generateGrid() {
                 }
             });
 
-            // mousedown starts a pipeline annotation drag from this cell
+            // mousedown starts a bypass annotation drag from this cell
             cell.addEventListener('mousedown', (e) => {
-                if (!pipelineAnnotationMode || e.button !== 0) return;
+                if (!bypassAnnotationMode || e.button !== 0) return;
                 e.preventDefault(); // Prevent browser text-selection during drag
 
-                pipelineSource   = {row, col};
-                pipelineDragging = true;
+                bypassSource   = {row, col};
+                bypassDragging = true;
 
-                cell.classList.add('pipeline-source');
-                renderPipelineAnnotations();
+                cell.classList.add('bypass-source');
+                renderBypassAnnotations();
             });
 
             // mouseup on this cell completes the annotation (source → this cell)
             cell.addEventListener('mouseup', (e) => {
-                if (!pipelineDragging || e.button !== 0) return;
+                if (!bypassDragging || e.button !== 0) return;
 
-                const source = pipelineSource;
+                const source = bypassSource;
 
                 // Reset drag state BEFORE any async work so the document-level
-                // mouseup handler sees pipelineDragging = false and does nothing
-                pipelineDragging = false;
-                pipelineSource   = null;
-                document.querySelectorAll('.grid-cell.pipeline-source')
-                        .forEach(c => c.classList.remove('pipeline-source'));
+                // mouseup handler sees bypassDragging = false and does nothing
+                bypassDragging = false;
+                bypassSource   = null;
+                document.querySelectorAll('.grid-cell.bypass-source')
+                        .forEach(c => c.classList.remove('bypass-source'));
 
                 const isSameCell = source && source.row === row && source.col === col;
                 if (source && !isSameCell) {
-                    savePipelineAnnotation(selectedPipelineType, source, {row, col});
+                    saveBypassAnnotation(selectedBypassType, source, {row, col});
                 } else {
-                    renderPipelineAnnotations(); // Redraw to remove the preview circle
+                    renderBypassAnnotations(); // Redraw to remove the preview circle
                 }
             });
 
@@ -569,7 +529,7 @@ function generateGrid() {
     }
 
     // Check rules after grid generation
-    renderPipelineAnnotations(); // NEW: redraw SVG after grid is rebuilt
+    renderBypassAnnotations(); // NEW: redraw SVG after grid is rebuilt
     checkRules();
 }
 
@@ -590,18 +550,18 @@ document.getElementById('cols-slider').addEventListener('input', (e) => {
 
 // Cancel a pipeline drag if the mouse button is released outside any grid cell
 document.addEventListener('mouseup', (e) => {
-    if (!pipelineDragging || e.button !== 0) return;
-    // If pipelineDragging is still true here, the mouseup happened outside a cell
-    pipelineDragging = false;
-    pipelineSource   = null;
-    document.querySelectorAll('.grid-cell.pipeline-source')
-             .forEach(c => c.classList.remove('pipeline-source'));
-    renderPipelineAnnotations();
+    if (!bypassDragging || e.button !== 0) return;
+    // If bypassDragging is still true here, the mouseup happened outside a cell
+    bypassDragging = false;
+    bypassSource   = null;
+    document.querySelectorAll('.grid-cell.bypass-source')
+             .forEach(c => c.classList.remove('bypass-source'));
+    renderBypassAnnotations();
 });
 
 // Move the ghost circle to follow the cursor whenever annotation mode is active
 document.addEventListener('mousemove', (e) => {
-    if (!pipelineAnnotationMode) return;
+    if (!bypassAnnotationMode) return;
     const ghost = document.getElementById('ghost-circle');
     ghost.style.left = `${e.clientX}px`;
     ghost.style.top  = `${e.clientY}px`;
@@ -609,9 +569,9 @@ document.addEventListener('mousemove', (e) => {
 
 // Close the pipeline type dropdown when clicking anywhere outside the tool
 document.addEventListener('click', (e) => {
-    if (pipelineMenuOpen && !e.target.closest('#pipeline-tool')) {
-        pipelineMenuOpen = false;
-        document.getElementById('pipeline-type-list').classList.remove('visible');
+    if (bypassMenuOpen && !e.target.closest('#bypass-tool')) {
+        bypassMenuOpen = false;
+        document.getElementById('bypass-type-list').classList.remove('visible');
     }
 });
 
@@ -674,7 +634,7 @@ async function loadStateFromServer() {
     instructions = state.instructions || {};
     currentRows = state.rows || 10;
     currentCols = state.cols || 10;
-    currentPipelineCount = state.pipeline_count || 1;
+    bypassAnnotations = state.bypass_annotations || [];
 
     // Update sliders
     document.getElementById('rows-slider').value = currentRows;
@@ -682,19 +642,11 @@ async function loadStateFromServer() {
     document.getElementById('rows-value').textContent = currentRows;
     document.getElementById('cols-value').textContent = currentCols;
 
-    // Update pipeline radio buttons
-    const pipelineRadio = document.querySelector(`input[name="pipelines"][value="${currentPipelineCount}"]`);
-    if (pipelineRadio) {
-        pipelineRadio.checked = true;
-    }
-
     // Load rules info
     if (state.rules) {
         rulesInfo = state.rules;
         renderRulesPanel();
     }
-
-    pipelineAnnotations = state.pipeline_annotations || [];
     generateGrid();
 }
 
@@ -709,9 +661,8 @@ function saveState() {
         instructions:          instructions,
         rows:                  currentRows,
         cols:                  currentCols,
-        pipeline_count:        currentPipelineCount,
         rules:                 rulesInfo,
-        pipeline_annotations:  pipelineAnnotations   // NEW
+        bypass_annotations:  bypassAnnotations   // NEW
     };
 
     const json = JSON.stringify(state, null, 2);
@@ -740,21 +691,13 @@ function loadState() {
             instructions = state.instructions || {};
             currentRows = state.rows || 10;
             currentCols = state.cols || 10;
-            currentPipelineCount = state.pipeline_count || 1;
-
-            pipelineAnnotations = state.pipeline_annotations || [];
+            bypassAnnotations = state.bypass_annotations || [];
 
             // Update sliders
             document.getElementById('rows-slider').value = currentRows;
             document.getElementById('cols-slider').value = currentCols;
             document.getElementById('rows-value').textContent = currentRows;
             document.getElementById('cols-value').textContent = currentCols;
-
-            // Update pipeline radio buttons
-            const pipelineRadio = document.querySelector(`input[name="pipelines"][value="${currentPipelineCount}"]`);
-            if (pipelineRadio) {
-                pipelineRadio.checked = true;
-            }
 
             // Update rules if provided
             if (state.rules) {
@@ -769,7 +712,7 @@ function loadState() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(state),
-                pipeline_annotations: pipelineAnnotations
+                bypass_annotations: bypassAnnotations
             });
         };
         reader.readAsText(file);
@@ -788,8 +731,8 @@ async function clearGrid() {
         instructions = {};
         generateGrid();
 
-        pipelineAnnotations = [];
-        renderPipelineAnnotations();
+        bypassAnnotations = [];
+        renderBypassAnnotations();
 
         await fetch('/api/state', {
             method: 'POST',
@@ -799,9 +742,8 @@ async function clearGrid() {
                 instructions: {},
                 rows: currentRows,
                 cols: currentCols,
-                pipeline_count: currentPipelineCount,
                 rules: rulesInfo,
-                pipeline_annotations: []
+                bypass_annotations: []
             })
         });
 
@@ -810,23 +752,99 @@ async function clearGrid() {
     }
 }
 
-// ─── Pipeline tool initialisation ─────────────────────────────────────────
+/**
+ * Prompt the user to select a .yaml config file, upload it to the server,
+ * and hot-reload all config-derived data structures without a page refresh.
+ *
+ * On success:
+ *   - Reassigns BLOCK_TYPES, BYPASS_TYPES, INSTRUCTION_FORMATS,
+ *     INSTRUCTION_NAMES from the server response
+ *   - Updates the config name display
+ *   - Calls initPalette(), initBypassTool(), loadRules(), generateGrid()
+ *     to rebuild all affected UI sections
+ *
+ * On validation failure (HTTP 400):
+ *   - Displays the list of validation error strings from the server
+ *
+ * @async
+ */
+async function importConfig() {
+    const input    = document.createElement('input');
+    input.type     = 'file';
+    input.accept   = '.yaml,.yml';
+
+    input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+
+        const formData = new FormData();
+        formData.append('config', file);
+
+        let response;
+        try {
+            response = await fetch('/api/config', {
+                method: 'POST',
+                body:   formData,
+                // Do NOT set Content-Type — the browser must add the
+                // multipart boundary automatically.
+            });
+        } catch (networkError) {
+            console.error('importConfig: network error', networkError);
+            alert('Failed to reach the server: ' + networkError.message);
+            return;
+        }
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            // Server returned HTTP 400 with a list of validation errors
+            const errorText = (data.errors || ['Unknown error']).join('\n• ');
+            alert(`Config validation failed:\n\n• ${errorText}`);
+            return;
+        }
+
+        // ── Reassign all config-derived globals ──────────────────────
+        BLOCK_TYPES         = data.block_types;
+        BYPASS_TYPES        = data.bypass_types;
+        INSTRUCTION_FORMATS = data.instruction_formats;
+        INSTRUCTION_NAMES   = Object.keys(INSTRUCTION_FORMATS);
+
+        // ── Update config name display ────────────────────────────────
+        const configNameEl = document.getElementById('config-name');
+        if (configNameEl) {
+            configNameEl.textContent = (data.meta && data.meta.name)
+                ? data.meta.name
+                : '';
+        }
+
+        // ── Rebuild all affected UI sections ──────────────────────────
+        try { initPalette();     } catch (err) { console.error('initPalette failed:', err); }
+        try { initBypassTool();  } catch (err) { console.error('initBypassTool failed:', err); }
+
+        await loadRules();
+        generateGrid();
+    };
+
+    input.click();
+}
+
+// ─── Bypass tool initialisation ─────────────────────────────────────────
 
 /**
- * Populate the pipeline-type dropdown with one item per PIPELINE_TYPES entry.
+ * Populate the bypass-type dropdown with one item per BYPASS_TYPES entry.
  * Each item shows a coloured dot and the type name + description.
  * Called once during page initialisation.
  */
-function initPipelineTool() {
-    const typeList = document.getElementById('pipeline-type-list');
+function initBypassTool() {
+    const typeList = document.getElementById('bypass-type-list');
     typeList.innerHTML = '';
 
-    PIPELINE_TYPES.forEach(type => {
+    BYPASS_TYPES.forEach(type => {
         const item = document.createElement('div');
-        item.className = 'pipeline-type-item';
+        item.className = 'bypass-type-item';
 
         const dot = document.createElement('div');
-        dot.className = 'pipeline-type-dot';
+        dot.className = 'bypass-type-dot';
         dot.style.backgroundColor = type.color;
 
         const label = document.createElement('span');
@@ -834,60 +852,60 @@ function initPipelineTool() {
 
         item.appendChild(dot);
         item.appendChild(label);
-        item.addEventListener('click', () => selectPipelineType(type));
+        item.addEventListener('click', () => selectBypassType(type));
         typeList.appendChild(item);
     });
 }
 
 /**
  * Toggle the pipeline type dropdown, or exit annotation mode if already active.
- * Wired to the "Add Pipeline" button's onclick attribute.
+ * Wired to the "Add Bypass" button's onclick attribute.
  */
-function togglePipelineMenu() {
-    if (pipelineAnnotationMode) {
+function toggleBypassMenu() {
+    if (bypassAnnotationMode) {
         exitPipelineMode();
         return;
     }
-    pipelineMenuOpen = !pipelineMenuOpen;
-    document.getElementById('pipeline-type-list')
-        .classList.toggle('visible', pipelineMenuOpen);
+    bypassMenuOpen = !bypassMenuOpen;
+    document.getElementById('bypass-type-list')
+        .classList.toggle('visible', bypassMenuOpen);
 }
 
 /**
- * Enter pipeline annotation mode for the given type.
+ * Enter bypass annotation mode for the given type.
  * Greys out the button, shows the ghost circle, and awaits the first cell click.
  *
- * @param {Object} type - A PIPELINE_TYPES entry {name, color, description}
+ * @param {Object} type - A BYPASS_TYPES entry {name, color, description}
  */
 /**
- * Enter pipeline annotation mode for the given type.
- * Greys out the button, applies the pipeline-mode CSS class to the grid
+ * Enter bypass annotation mode for the given type.
+ * Greys out the button, applies the bypass-mode CSS class to the grid
  * (which disables block interaction and enables cell hover), sets CSS
  * colour variables to match the type, and shows the ghost circle.
  *
- * @param {Object} type - A PIPELINE_TYPES entry {name, color, description}
+ * @param {Object} type - A BYPASS_TYPES entry {name, color, description}
  */
-function selectPipelineType(type) {
-    selectedPipelineType   = type;
-    pipelineAnnotationMode = true;
-    pipelineSource         = null;
-    pipelineDragging       = false;
-    pipelineMenuOpen       = false;
+function selectBypassType(type) {
+    selectedBypassType   = type;
+    bypassAnnotationMode = true;
+    bypassSource         = null;
+    bypassDragging       = false;
+    bypassMenuOpen       = false;
 
-    document.getElementById('pipeline-type-list').classList.remove('visible');
+    document.getElementById('bypass-type-list').classList.remove('visible');
 
-    const btn = document.getElementById('pipeline-btn');
+    const btn = document.getElementById('bypass-btn');
     btn.classList.add('active');
     btn.textContent = `◉ ${type.name} (active – click to exit)`;
 
     // Add CSS class that drives hover highlight and pointer-event rules
     const grid = document.getElementById('grid');
-    grid.classList.add('pipeline-mode');
+    grid.classList.add('bypass-mode');
 
     // Set per-type CSS variables so hover colour matches the annotation colour
     const {r, g, b} = hexToRgb(type.color);
-    grid.style.setProperty('--pipeline-hover-bg',     `rgba(${r}, ${g}, ${b}, 0.15)`);
-    grid.style.setProperty('--pipeline-hover-border',  `rgba(${r}, ${g}, ${b}, 0.40)`);
+    grid.style.setProperty('--bypass-hover-bg',     `rgba(${r}, ${g}, ${b}, 0.15)`);
+    grid.style.setProperty('--bypass-hover-border',  `rgba(${r}, ${g}, ${b}, 0.40)`);
 
     // Style the ghost circle to match
     const ghost = document.getElementById('ghost-circle');
@@ -899,30 +917,30 @@ function selectPipelineType(type) {
 }
 
 /**
- * Exit pipeline annotation mode and restore default UI state.
- * Removes pipeline-mode CSS class (re-enables block dragging and hover),
+ * Exit bypass annotation mode and restore default UI state.
+ * Removes bypass-mode CSS class (re-enables block dragging and hover),
  * hides the ghost circle, and resets all drag tracking variables.
  */
 function exitPipelineMode() {
-    pipelineAnnotationMode = false;
-    selectedPipelineType   = null;
-    pipelineSource         = null;
-    pipelineDragging       = false;
+    bypassAnnotationMode = false;
+    selectedBypassType   = null;
+    bypassSource         = null;
+    bypassDragging       = false;
 
-    const btn = document.getElementById('pipeline-btn');
+    const btn = document.getElementById('bypass-btn');
     btn.classList.remove('active');
-    btn.textContent = '✚ Add Pipeline';
+    btn.textContent = '✚ Add Bypass';
 
     const grid = document.getElementById('grid');
-    grid.classList.remove('pipeline-mode');
+    grid.classList.remove('bypass-mode');
     grid.style.cursor = '';
 
     document.getElementById('ghost-circle').style.display = 'none';
 
-    document.querySelectorAll('.grid-cell.pipeline-source')
-            .forEach(c => c.classList.remove('pipeline-source'));
+    document.querySelectorAll('.grid-cell.bypass-source')
+            .forEach(c => c.classList.remove('bypass-source'));
 
-    renderPipelineAnnotations();
+    renderBypassAnnotations();
 }
 
 // ─── Annotation placement ──────────────────────────────────────────────────
@@ -935,20 +953,20 @@ function exitPipelineMode() {
  * @param {number} row
  * @param {number} col
  */
-async function handlePipelineCellRightClick(row, col) {
-    await fetch('/api/pipeline-annotations', {
+async function handleBypassCellRightClick(row, col) {
+    await fetch('/api/bypass-annotations', {
         method: 'DELETE',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({row, col})
     });
 
     // Sync local state: drop annotations involving this cell
-    pipelineAnnotations = pipelineAnnotations.filter(a =>
+    bypassAnnotations = bypassAnnotations.filter(a =>
         !(a.source.row === row && a.source.col === col) &&
         !(a.target.row === row && a.target.col === col)
     );
 
-    renderPipelineAnnotations();
+    renderBypassAnnotations();
 }
 
 // ─── Persistence ──────────────────────────────────────────────────────────
@@ -961,16 +979,16 @@ async function handlePipelineCellRightClick(row, col) {
  * @param {Object} source - {row, col}
  * @param {Object} target - {row, col}
  */
-async function savePipelineAnnotation(type, source, target) {
-    const response = await fetch('/api/pipeline-annotations', {
+async function saveBypassAnnotation(type, source, target) {
+    const response = await fetch('/api/bypass-annotations', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({annotation_type: type.name, source, target})
     });
     const data = await response.json();
     if (data.success) {
-        pipelineAnnotations.push(data.annotation);
-        renderPipelineAnnotations();
+        bypassAnnotations.push(data.annotation);
+        renderBypassAnnotations();
     }
 }
 
@@ -1000,8 +1018,8 @@ function getCellCenter(row, col) {
  * - A circle + arrow line for each saved annotation
  * - A dashed preview circle around the selected source cell (if any)
  */
-function renderPipelineAnnotations() {
-    const svg  = document.getElementById('pipeline-svg');
+function renderBypassAnnotations() {
+    const svg  = document.getElementById('bypass-svg');
     const grid = document.getElementById('grid');
     if (!svg || !grid) return;
 
@@ -1013,8 +1031,8 @@ function renderPipelineAnnotations() {
     const defs = document.createElementNS('http://www.w3.org/2000/svg', 'defs');
     svg.appendChild(defs);
 
-    const colorsNeeded = new Set(pipelineAnnotations.map(a => a.color));
-    if (selectedPipelineType) colorsNeeded.add(selectedPipelineType.color);
+    const colorsNeeded = new Set(bypassAnnotations.map(a => a.color));
+    if (selectedBypassType) colorsNeeded.add(selectedBypassType.color);
 
     colorsNeeded.forEach(color => {
         const id     = `arrow-${color.replace('#', '')}`;
@@ -1034,17 +1052,17 @@ function renderPipelineAnnotations() {
     });
 
     // ── Draw saved annotations ──
-    pipelineAnnotations.forEach(a => drawAnnotation(svg, a.source, a.target, a.color));
+    bypassAnnotations.forEach(a => drawAnnotation(svg, a.source, a.target, a.color));
 
     // ── Draw dashed preview circle around source (if awaiting target click) ──
-    if (pipelineSource && selectedPipelineType) {
-        const c      = getCellCenter(pipelineSource.row, pipelineSource.col);
+    if (bypassSource && selectedBypassType) {
+        const c      = getCellCenter(bypassSource.row, bypassSource.col);
         const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
         circle.setAttribute('cx',           c.x);
         circle.setAttribute('cy',           c.y);
         circle.setAttribute('r',            28);
         circle.setAttribute('fill',         'none');
-        circle.setAttribute('stroke',       selectedPipelineType.color);
+        circle.setAttribute('stroke',       selectedBypassType.color);
         circle.setAttribute('stroke-width', '2');
         circle.setAttribute('stroke-dasharray', '5,3');
         svg.appendChild(circle);
@@ -1053,13 +1071,13 @@ function renderPipelineAnnotations() {
 }
 
 /**
- * Rebuild the annotation list panel from the current pipelineAnnotations array.
+ * Rebuild the annotation list panel from the current bypassAnnotations array.
  *
- * Each item shows a coloured dot, the annotation type, source cell
+ * Each item shows a colored dot, the annotation type, source cell
  * (row + instruction name if available + column), and target cell in the
  * same format, plus a delete button.
  *
- * Called automatically at the end of renderPipelineAnnotations().
+ * Called automatically at the end of renderBypassAnnotations().
  */
 function renderAnnotationList() {
     const list = document.getElementById('annotation-list');
@@ -1067,7 +1085,7 @@ function renderAnnotationList() {
 
     list.innerHTML = '';
 
-    if (pipelineAnnotations.length === 0) {
+    if (bypassAnnotations.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'annotation-panel-empty';
         empty.textContent = 'No annotations yet.';
@@ -1075,7 +1093,7 @@ function renderAnnotationList() {
         return;
     }
 
-    pipelineAnnotations.forEach(annotation => {
+    bypassAnnotations.forEach(annotation => {
         // ── Resolve human-readable labels for each endpoint ──
         const srcInstr = instructions[annotation.source.row];
         const tgtInstr = instructions[annotation.target.row];
@@ -1123,10 +1141,10 @@ function renderAnnotationList() {
  * exactly one annotation even if multiple share a source or target cell.
  *
  * @async
- * @param {Object} annotation - An entry from pipelineAnnotations
+ * @param {Object} annotation - An entry from bypassAnnotations
  */
 async function deleteSpecificAnnotation(annotation) {
-    await fetch('/api/pipeline-annotations', {
+    await fetch('/api/bypass-annotations', {
         method: 'DELETE',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({
@@ -1137,7 +1155,7 @@ async function deleteSpecificAnnotation(annotation) {
     });
 
     // Sync client-side array
-    pipelineAnnotations = pipelineAnnotations.filter(a =>
+    bypassAnnotations = bypassAnnotations.filter(a =>
         !(a.source.row      === annotation.source.row  &&
           a.source.col      === annotation.source.col  &&
           a.target.row      === annotation.target.row  &&
@@ -1145,7 +1163,7 @@ async function deleteSpecificAnnotation(annotation) {
           a.annotation_type === annotation.annotation_type)
     );
 
-    renderPipelineAnnotations(); // Also calls renderAnnotationList
+    renderBypassAnnotations(); // Also calls renderAnnotationList
 }
 
 /**
@@ -1199,7 +1217,7 @@ function drawAnnotation(svg, source, target, color) {
 
 // Initialize
 initPalette();
-initPipelineTool();
+initBypassTool();
 loadRules().then(() => {
     loadStateFromServer();
 });
