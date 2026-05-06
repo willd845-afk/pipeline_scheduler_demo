@@ -23,6 +23,11 @@ let bypassAnnotations    = [];
 let bypassMenuOpen       = false;
 let bypassDragging       = false;
 
+// Maps bypass annotation array index → hex color string for violation highlights.
+// Populated by updateViolationUI(); consumed by renderBypassAnnotations().
+// Reset to {} when violations are cleared.
+let currentAnnotationHighlights = {};
+
 /**
  * Convert a hex colour string to an {r, g, b} object.
  * Used to build rgba() values for CSS variables and the ghost circle.
@@ -320,8 +325,18 @@ async function checkRules() {
  * Update the UI to reflect current rule violations.
  * Highlights violated cells and rows, displays violation messages.
  */
+/**
+ * Update the UI to reflect the current set of rule violations.
+ *
+ * Handles both the original cell/row highlighting and the new
+ * annotation-index highlighting introduced by WhenThenRule.
+ *
+ * After updating currentAnnotationHighlights, calls
+ * renderBypassAnnotations() so the SVG overlay reflects the new state
+ * without a separate explicit call.
+ */
 function updateViolationUI() {
-    // Clear all violation classes
+    // ── Clear all existing highlights ────────────────────────────────
     document.querySelectorAll('.grid-cell').forEach(cell => {
         cell.classList.remove('violation');
     });
@@ -330,45 +345,58 @@ function updateViolationUI() {
     });
 
     const violationsSummary = document.getElementById('violations-summary');
-    const violationsList = document.getElementById('violations-list');
+    const violationsList    = document.getElementById('violations-list');
 
     if (currentViolations.length === 0) {
         violationsSummary.classList.remove('active');
+        currentAnnotationHighlights = {};
+        renderBypassAnnotations();
         return;
     }
 
-    // Show violations summary
+    // ── Accumulate highlights ─────────────────────────────────────────
+    const annotationHighlights = {};  // { index: hexColor }
+
     violationsSummary.classList.add('active');
     violationsList.innerHTML = '';
 
     currentViolations.forEach(violation => {
-        // Highlight affected cells
-        violation.cells.forEach(cell => {
-            const cellElement = document.querySelector(
+        // Grid cell highlights
+        (violation.cells || []).forEach(cell => {
+            const cellEl = document.querySelector(
                 `.grid-cell[data-row="${cell.row}"][data-col="${cell.col}"]`
             );
-            if (cellElement) {
-                cellElement.classList.add('violation');
-            }
+            if (cellEl) cellEl.classList.add('violation');
         });
 
-        // Highlight affected rows
-        violation.rows.forEach(rowNum => {
+        // Row label highlights
+        (violation.rows || []).forEach(rowNum => {
             const rowLabel = document.querySelector(
                 `.row-label[data-row="${rowNum}"]`
             );
-            if (rowLabel) {
-                rowLabel.classList.add('violation');
-            }
+            if (rowLabel) rowLabel.classList.add('violation');
         });
 
-        // Add violation to list
-        const violationItem = document.createElement('div');
-        violationItem.textContent = `• ${violation.message}`;
-        violationItem.style.marginLeft = '10px';
-        violationItem.style.marginTop = '5px';
-        violationsList.appendChild(violationItem);
+        // Bypass annotation highlights (new)
+        if (violation.annotation_indices && violation.highlight_color) {
+            violation.annotation_indices.forEach(idx => {
+                // Later violations overwrite earlier ones for the same index;
+                // the last matching rule's color wins
+                annotationHighlights[idx] = violation.highlight_color;
+            });
+        }
+
+        // Violations list entry
+        const item = document.createElement('div');
+        item.textContent    = `• ${violation.message}`;
+        item.style.marginLeft = '10px';
+        item.style.marginTop  = '5px';
+        violationsList.appendChild(item);
     });
+
+    // ── Re-render SVG with new highlights ─────────────────────────────
+    currentAnnotationHighlights = annotationHighlights;
+    renderBypassAnnotations();
 }
 /**
  * Generate the scheduling grid and row labels with instruction editors.
@@ -756,22 +784,47 @@ async function clearGrid() {
  * Prompt the user to select a .yaml config file, upload it to the server,
  * and hot-reload all config-derived data structures without a page refresh.
  *
- * On success:
+ * Validation model:
+ *   - Errors are treated as blocking failures (import is aborted)
+ *   - Warnings are non-blocking and do not prevent import
+ *
+ * On success (HTTP 200):
  *   - Reassigns BLOCK_TYPES, BYPASS_TYPES, INSTRUCTION_FORMATS,
  *     INSTRUCTION_NAMES from the server response
  *   - Updates the config name display
+ *   - Displays warnings if present (non-blocking)
  *   - Calls initPalette(), initBypassTool(), loadRules(), generateGrid()
  *     to rebuild all affected UI sections
  *
  * On validation failure (HTTP 400):
  *   - Displays the list of validation error strings from the server
+ *   - Aborts import without modifying application state
+ *
+ * On network or parsing failure:
+ *   - Displays a generic error message and aborts import
+ *
+ * @async
+ */
+/**
+ * Prompt the user to select a .yaml config file, upload it to the server,
+ * and hot-reload all config-derived data structures without a page refresh.
+ *
+ * On success:
+ *   - Reassigns BLOCK_TYPES, BYPASS_TYPES, INSTRUCTION_FORMATS,
+ *     INSTRUCTION_NAMES from the server response
+ *   - Updates the config name display
+ *   - Displays any non-blocking warnings in the warnings banner
+ *   - Calls initPalette(), initBypassTool(), loadRules(), generateGrid()
+ *
+ * On validation failure (HTTP 400):
+ *   - Displays the list of blocking error strings in an alert
  *
  * @async
  */
 async function importConfig() {
-    const input    = document.createElement('input');
-    input.type     = 'file';
-    input.accept   = '.yaml,.yml';
+    const input  = document.createElement('input');
+    input.type   = 'file';
+    input.accept = '.yaml,.yml';
 
     input.onchange = async (e) => {
         const file = e.target.files[0];
@@ -785,8 +838,6 @@ async function importConfig() {
             response = await fetch('/api/config', {
                 method: 'POST',
                 body:   formData,
-                // Do NOT set Content-Type — the browser must add the
-                // multipart boundary automatically.
             });
         } catch (networkError) {
             console.error('importConfig: network error', networkError);
@@ -797,19 +848,18 @@ async function importConfig() {
         const data = await response.json();
 
         if (!response.ok) {
-            // Server returned HTTP 400 with a list of validation errors
             const errorText = (data.errors || ['Unknown error']).join('\n• ');
             alert(`Config validation failed:\n\n• ${errorText}`);
             return;
         }
 
-        // ── Reassign all config-derived globals ──────────────────────
+        // ── Reassign config-derived globals ──────────────────────────
         BLOCK_TYPES         = data.block_types;
         BYPASS_TYPES        = data.bypass_types;
         INSTRUCTION_FORMATS = data.instruction_formats;
         INSTRUCTION_NAMES   = Object.keys(INSTRUCTION_FORMATS);
 
-        // ── Update config name display ────────────────────────────────
+        // ── Config name display ───────────────────────────────────────
         const configNameEl = document.getElementById('config-name');
         if (configNameEl) {
             configNameEl.textContent = (data.meta && data.meta.name)
@@ -817,15 +867,50 @@ async function importConfig() {
                 : '';
         }
 
-        // ── Rebuild all affected UI sections ──────────────────────────
-        try { initPalette();     } catch (err) { console.error('initPalette failed:', err); }
-        try { initBypassTool();  } catch (err) { console.error('initBypassTool failed:', err); }
+        // ── Non-blocking warnings ─────────────────────────────────────
+        showConfigWarnings(data.warnings || []);
+
+        // ── Rebuild affected UI sections ──────────────────────────────
+        try { initPalette();    } catch (err) { console.error('initPalette failed:', err); }
+        try { initBypassTool(); } catch (err) { console.error('initBypassTool failed:', err); }
 
         await loadRules();
         generateGrid();
     };
 
     input.click();
+}
+
+/**
+ * Display non-blocking config warnings in the warnings banner.
+ *
+ * Hides the banner when the list is empty so it does not take up
+ * space on a clean config load.  Each call fully replaces the previous
+ * warning list.
+ *
+ * @param {string[]} warnings - Array of warning strings from the server
+ */
+function showConfigWarnings(warnings) {
+    const banner = document.getElementById('config-warnings-banner');
+    const list   = document.getElementById('config-warnings-list');
+    if (!banner || !list) return;
+
+    list.innerHTML = '';
+
+    if (!warnings || warnings.length === 0) {
+        banner.style.display = 'none';
+        return;
+    }
+
+    warnings.forEach(w => {
+        console.warn('Config warning:', w);
+        const item       = document.createElement('li');
+        item.textContent = w;
+        item.style.marginBottom = '4px';
+        list.appendChild(item);
+    });
+
+    banner.style.display = 'block';
 }
 
 // ─── Bypass tool initialisation ─────────────────────────────────────────
@@ -1052,7 +1137,19 @@ function renderBypassAnnotations() {
     });
 
     // ── Draw saved annotations ──
-    bypassAnnotations.forEach(a => drawAnnotation(svg, a.source, a.target, a.color));
+    // ── Draw saved annotations ── (replace the existing forEach call)
+    bypassAnnotations.forEach((a, idx) => {
+        const overrideColor  = currentAnnotationHighlights[idx] || null;
+        const isHighlighted  = idx in currentAnnotationHighlights;
+        drawAnnotation(
+            svg,
+            a.source,
+            a.target,
+            a.color,
+            isHighlighted,
+            overrideColor
+        );
+    });
 
     // ── Draw dashed preview circle around source (if awaiting target click) ──
     if (bypassSource && selectedBypassType) {
@@ -1178,10 +1275,30 @@ async function deleteSpecificAnnotation(annotation) {
  * @param {{row:number, col:number}} target
  * @param {string}                   color   - Hex colour string
  */
-function drawAnnotation(svg, source, target, color) {
+/**
+ * Draw one bypass annotation onto the SVG overlay.
+ *
+ * Renders a circle around the source cell and a line with an arrowhead
+ * pointing to the target cell.  When isHighlighted is true, the stroke
+ * is thickened and a glow filter is applied to draw attention to the
+ * violation.
+ *
+ * @param {SVGElement} svg
+ * @param {{row:number, col:number}} source
+ * @param {{row:number, col:number}} target
+ * @param {string}  color         - Hex color string for normal drawing
+ * @param {boolean} isHighlighted - True when a rule violation applies
+ * @param {string}  [highlightColor] - Override color when highlighted;
+ *                                     defaults to color if not supplied
+ */
+function drawAnnotation(svg, source, target, color,
+                        isHighlighted = false,
+                        highlightColor = null) {
     const CIRCLE_R  = 28;
     const CELL_HALF = 25;
-    const markerId  = `arrow-${color.replace('#', '')}`;
+    const drawColor = (isHighlighted && highlightColor) ? highlightColor : color;
+    const markerId  = `arrow-${drawColor.replace('#', '')}`;
+    const strokeW   = isHighlighted ? '3' : '2';
 
     const src = getCellCenter(source.row, source.col);
     const tgt = getCellCenter(target.row, target.col);
@@ -1193,25 +1310,34 @@ function drawAnnotation(svg, source, target, color) {
     const nx = dx / len;
     const ny = dy / len;
 
-    // Circle around source
+    // ── Circle around source ──────────────────────────────────────────
     const circle = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
     circle.setAttribute('cx',           src.x);
     circle.setAttribute('cy',           src.y);
     circle.setAttribute('r',            CIRCLE_R);
     circle.setAttribute('fill',         'none');
-    circle.setAttribute('stroke',       color);
-    circle.setAttribute('stroke-width', '2');
+    circle.setAttribute('stroke',       drawColor);
+    circle.setAttribute('stroke-width', strokeW);
+    if (isHighlighted) {
+        circle.setAttribute('stroke-dasharray', '');  // solid when highlighted
+        circle.setAttribute('filter',
+            `drop-shadow(0 0 4px ${drawColor})`);
+    }
     svg.appendChild(circle);
 
-    // Arrow from source circle edge to target cell edge
+    // ── Arrow line ────────────────────────────────────────────────────
     const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
     line.setAttribute('x1',           src.x + nx * CIRCLE_R);
     line.setAttribute('y1',           src.y + ny * CIRCLE_R);
     line.setAttribute('x2',           tgt.x - nx * (CELL_HALF - 2));
     line.setAttribute('y2',           tgt.y - ny * (CELL_HALF - 2));
-    line.setAttribute('stroke',       color);
-    line.setAttribute('stroke-width', '2');
+    line.setAttribute('stroke',       drawColor);
+    line.setAttribute('stroke-width', strokeW);
     line.setAttribute('marker-end',   `url(#${markerId})`);
+    if (isHighlighted) {
+        line.setAttribute('filter',
+            `drop-shadow(0 0 4px ${drawColor})`);
+    }
     svg.appendChild(line);
 }
 

@@ -1,0 +1,229 @@
+meta:
+  name: "Grid Pipeline Constraint Visualizer"
+  description: >
+    Users manually construct pipeline layouts and bypass connections
+    on a grid. The system validates rules and returns violation
+    highlights only. No simulation or execution semantics exist.
+  model_type: "editor_validation_system"
+
+
+# --------------------------------------------------
+# INSTRUCTIONS (FIXED)
+# --------------------------------------------------
+instructions:
+  add:
+    operands: [rd, rs1, rs2]
+    type: R_TYPE
+    format: "add rd, rs1, rs2"
+
+  addi:
+    operands: [rd, rs1, imm]
+    type: I_TYPE
+    format: "addi rd, rs1, imm"
+
+  mul:
+    operands: [rd, rs1, rs2]
+    type: R_TYPE
+    format: "mul rd, rs1, rs2"
+
+  lw:
+    operands: [rd, rs1, imm]
+    type: I_STORE
+    format: "lw rd, imm(rs1)"
+
+  sw:
+    operands: [rs2, rs1, imm]
+    type: I_STORE
+    format: "sw rs2, imm(rs1)"
+
+  bne:
+    operands: [rs1, rs2, imm]
+    type: B_TYPE
+    format: "bne rs1, rs2, imm"
+
+  jr:
+    operands: [rs1]
+    type: JR_TYPE
+    format: "jr rs1"
+
+  jal:
+    operands: [rd, imm]
+    type: J_TYPE
+    format: "jal rd, imm"
+
+
+# --------------------------------------------------
+# BYPASS TYPES (FIXED: list format required)
+# --------------------------------------------------
+bypass_types:
+  - name: RAW
+    color: "#cc0000"
+    description: "Read After Write violation"
+
+  - name: WAR
+    color: "#cc6600"
+    description: "Write After Read violation"
+
+  - name: WAW
+    color: "#9900cc"
+    description: "Write After Write violation"
+
+  - name: CONTROL
+    color: "#006600"
+    description: "Control dependency violation"
+
+  - name: STRUCTURAL
+    color: "#0066cc"
+    description: "Resource / placement conflict"
+
+
+# --------------------------------------------------
+# PIPELINE
+# --------------------------------------------------
+pipeline:
+  stages:
+    F: 1
+    D: 1
+    I: 1
+    X: 1
+    W: 1
+    C: 1
+
+
+# --------------------------------------------------
+# RULES (FIXED: added type field everywhere)
+# --------------------------------------------------
+rules:
+
+  - name: "RAW Dependency Violation"
+    description: "Highlights RAW dependency conflicts on bypass edges"
+    type: validation
+    enabled: true
+    when:
+      all:
+        - bypass_exists: true
+        - dependency_detected: RAW
+    then:
+      action:
+        type: highlight
+        target: bypass_annotation
+        color_ref: RAW
+
+  - name: "WAR Dependency Violation"
+    description: "Highlights WAR dependency conflicts"
+    type: validation
+    enabled: true
+    when:
+      dependency_detected: WAR
+    then:
+      action:
+        type: highlight
+        target: bypass_annotation
+        color_ref: WAR
+
+  - name: "WAW Dependency Violation" # the logic should live HERE
+    description: "Highlights WAW dependency conflicts"
+    type: validation
+    enabled: true
+    when:
+      dependency_detected: WAW
+    then:
+      action:
+        type: highlight
+        target: bypass_annotation
+        color_ref: WAW
+
+  - name: "Structural Grid Conflict"
+    description: "Detects overlapping or over-capacity stage placement"
+    type: validation
+    enabled: true
+    when:
+      grid_cell_overlapping: true
+    then:
+      action:
+        type: highlight
+        target: grid_cell
+        color_ref: STRUCTURAL
+
+  - name: "Control Dependency Warning"
+    description: "Marks control-related instructions for visualization"
+    type: validation
+    enabled: true
+    when:
+      instruction_type: [bne, jr, jal]
+    then:
+      action:
+        type: highlight
+        target: bypass_annotation
+        color_ref: CONTROL
+  # --------------------------------------------------
+  # COLUMN CAPACITY CONSTRAINT
+  # --------------------------------------------------
+  - name: "Pipeline Stage Capacity Per Column"
+    description: >
+      Ensures no column contains more pipeline stages than
+      the capacity defined in pipeline.stages
+    enabled: true
+    type: column_constraint
+
+    logic:
+      scope: column
+      target: grid_data
+
+      constraint:
+        group_by: stage
+
+        limit:
+          from: pipeline.stages
+          key: stage
+
+        ignore_if:
+          capacity_equals: 0
+
+        violation_message: >
+          Column {col} exceeds allowed stage capacity defined in pipeline.stages
+
+
+  # --------------------------------------------------
+  # STRICT PIPELINE ORDER CONSTRAINT
+  # --------------------------------------------------
+  - name: "Pipeline Stage Order Constraint"
+    description: >
+      Enforces strict left-to-right ordering:
+      F → D → I → X → W → C
+    enabled: true
+    type: validation
+
+    when:
+      stage_order_violation: true
+
+      # explicit allowed sequence definition (for validator reference)
+      allowed_sequence:
+        - F
+        - D
+        - I
+        - X
+        - W
+        - C
+
+    then:
+      action:
+        type: highlight
+        target: grid_cell
+        color_ref: STRUCTURAL
+
+# --------------------------------------------------
+# DEFAULTS
+# --------------------------------------------------
+defaults:
+  mode: "validation_only"
+  rows: 10
+  cols: 10
+  start_state: "./config/tiny_rv1_example.json"
+
+  unknown_state:
+    action: ignore
+
+  no_rule_match:
+    action: no_highlight
+    

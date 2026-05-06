@@ -1,29 +1,31 @@
 """
 pipeline/rules.py
 
-Defines the Rule abstract base class, Violation dataclass,
-ColumnConstraintRule, and the RuleChecker that manages all rules.
+Rule system for the CPU pipeline scheduler.
 
-Rules are no longer hard-coded. RuleChecker.load_rules_from_config()
-reads rule definitions from a PipelineConfig and instantiates the
-appropriate Rule subclass for each entry based on its 'type' field.
+Supports two rule formats:
 
-The 'column_constraint' type is the only type currently supported.
-Unknown types produce a UserWarning and are skipped so that a config
-file with one unknown rule type still loads its other rules correctly.
+1. Declarative when/then rules (new YAML architecture):
+   Used with 'validation_only' configs.  Each rule has a 'when' condition
+   block and a 'then' action block parsed from the YAML at load time.
 
-pipeline_count has been removed from all method signatures. Stage
-capacity limits are absolute values read directly from the config.
+2. Column-constraint rules (original architecture):
+   Used with configs that have a 'pipeline.stages' section.  Kept for
+   backward compatibility with the old YAML format.
+
+The RuleChecker detects which format each rule uses based on its structure
+and instantiates the appropriate class.
+
+pipeline_count has been removed.  Stage capacities are absolute values from
+the config.
 """
 
 import warnings
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Set, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # Imported only during static analysis to avoid circular imports at
-    # runtime (config.py imports nothing from the pipeline package).
     from .config import PipelineConfig
     from .instructions import Instruction
 
@@ -35,46 +37,428 @@ if TYPE_CHECKING:
 @dataclass
 class Violation:
     """
-    Represents a single rule violation detected in the current grid state.
+    Represents a single rule violation found in the current grid state.
 
     Attributes:
-        rule_name (str):                  Name of the rule that was violated
-        cells     (List[Tuple[int,int]]): (row, col) coordinates involved
-        rows      (List[int]):            Row numbers whose labels should be
-                                          highlighted in the UI
-        message   (str):                  Human-readable description built
-                                          from the YAML violation_message
-                                          template
+        rule_name           (str):                Name of the violated rule
+        cells               (List[Tuple[int,int]]): Grid cells to highlight
+        rows                (List[int]):           Row label indices to pulse
+        message             (str):                 Human-readable description
+        annotation_indices  (List[int]):           Indices into the
+                                                   bypass_annotations list
+                                                   whose SVG elements should
+                                                   be highlighted
+        highlight_color     (Optional[str]):       Hex color for annotation
+                                                   highlights; None means use
+                                                   the annotation's own color
     """
-    rule_name: str
-    cells:     List[Tuple[int, int]]
-    rows:      List[int]
-    message:   str
+    rule_name:          str
+    cells:              List[Tuple[int, int]]
+    rows:               List[int]
+    message:            str
+    annotation_indices: List[int]            = field(default_factory=list)
+    highlight_color:    Optional[str]        = None
 
 
 # ---------------------------------------------------------------------------
-# Rule (abstract base)
+# Evaluation context
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EvalContext:
+    """
+    All state available to condition evaluators at check time.
+
+    Passed by value to every condition's evaluate() call so conditions
+    are stateless and do not mutate shared state.
+
+    Attributes:
+        grid_data:          Maps (row, col) to block type string
+        instructions:       Maps row index to Instruction instance
+        rows:               Current grid row count
+        cols:               Current grid column count
+        bypass_annotations: List of BypassAnnotation instances
+    """
+    grid_data:          Dict[Tuple[int, int], str]
+    instructions:       Dict[int, Any]
+    rows:               int
+    cols:               int
+    bypass_annotations: List[Any]
+
+
+# ---------------------------------------------------------------------------
+# Condition result
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ConditionResult:
+    """
+    Returned by every condition's evaluate() method.
+
+    Attributes:
+        matched:             True if the condition fired
+        annotation_indices:  Indices into EvalContext.bypass_annotations
+                             that caused the match
+        cells:               Grid cell coordinates involved in the match
+        rows:                Row indices involved in the match
+    """
+    matched:             bool                     = False
+    annotation_indices:  List[int]                = field(default_factory=list)
+    cells:               List[Tuple[int, int]]    = field(default_factory=list)
+    rows:                List[int]                = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+
+class AllCondition:
+    """
+    Logical AND: every sub-condition must match.
+
+    Affected items are the union of all sub-conditions' affected items.
+    If any sub-condition does not match, returns matched=False with
+    empty affected-item lists.
+    """
+
+    def __init__(self, conditions: List):
+        self.conditions = conditions
+
+    def evaluate(self, ctx: EvalContext) -> ConditionResult:
+        combined = ConditionResult(matched=True)
+        for cond in self.conditions:
+            result = cond.evaluate(ctx)
+            if not result.matched:
+                return ConditionResult(matched=False)
+            combined.annotation_indices.extend(result.annotation_indices)
+            combined.cells.extend(result.cells)
+            combined.rows.extend(result.rows)
+        # Deduplicate while preserving order
+        combined.annotation_indices = list(dict.fromkeys(combined.annotation_indices))
+        combined.cells              = list(dict.fromkeys(combined.cells))
+        combined.rows               = list(dict.fromkeys(combined.rows))
+        return combined
+
+
+class BypassExistsCondition:
+    """
+    Matches when at least one bypass annotation is present.
+
+    bypass_exists: true  → matches when annotations exist
+    bypass_exists: false → matches when no annotations exist
+    """
+
+    def __init__(self, value: bool = True):
+        self.value = value
+
+    def evaluate(self, ctx: EvalContext) -> ConditionResult:
+        exists  = len(ctx.bypass_annotations) > 0
+        matched = (exists == self.value)
+        indices = list(range(len(ctx.bypass_annotations))) if matched else []
+        return ConditionResult(matched=matched, annotation_indices=indices)
+
+
+class DependencyDetectedCondition:
+    """
+    Matches when at least one bypass annotation has the given type.
+
+    dependency_detected: RAW  → find all annotations labeled 'RAW'
+
+    Case-insensitive comparison against annotation_type.
+
+    In the current 'validation_only' model the user labels annotations
+    manually, so this condition checks those labels rather than performing
+    semantic analysis of the instruction stream.  The architecture is
+    designed to support semantic analysis in a future update.
+    """
+
+    def __init__(self, dep_type: str):
+        self.dep_type = dep_type.upper()
+
+    def evaluate(self, ctx: EvalContext) -> ConditionResult:
+        matching = [
+            i for i, a in enumerate(ctx.bypass_annotations)
+            if a.annotation_type.upper() == self.dep_type
+        ]
+        return ConditionResult(
+            matched=len(matching) > 0,
+            annotation_indices=matching,
+            rows=sorted({
+                row
+                for i in matching
+                for row in (
+                    ctx.bypass_annotations[i].source[0],
+                    ctx.bypass_annotations[i].target[0],
+                )
+            }),
+        )
+
+
+class GridCellOverlappingCondition:
+    """
+    Matches when the same stage type appears more than once in a column.
+
+    Interprets 'structural overlap' as: two or more rows sharing the
+    same stage at the same column index, which indicates a resource
+    conflict in the pipeline.
+
+    grid_cell_overlapping: true  → detect column conflicts
+    grid_cell_overlapping: false → match only when no conflicts exist
+    """
+
+    def __init__(self, value: bool = True):
+        self.value = value
+
+    def evaluate(self, ctx: EvalContext) -> ConditionResult:
+        conflicting_cells: List[Tuple[int, int]] = []
+
+        for col in range(ctx.cols):
+            stage_positions: Dict[str, List[Tuple[int, int]]] = {}
+            for row in range(ctx.rows):
+                cell = (row, col)
+                if cell in ctx.grid_data:
+                    stage = ctx.grid_data[cell]
+                    stage_positions.setdefault(stage, []).append(cell)
+            for positions in stage_positions.values():
+                if len(positions) > 1:
+                    conflicting_cells.extend(positions)
+
+        has_conflict = len(conflicting_cells) > 0
+        matched      = (has_conflict == self.value)
+
+        if not matched:
+            return ConditionResult(matched=False)
+
+        return ConditionResult(
+            matched=True,
+            cells=conflicting_cells,
+            rows=sorted({c[0] for c in conflicting_cells}),
+        )
+
+
+class InstructionTypeCondition:
+    """
+    Matches when any row's instruction has a mnemonic in the given list.
+
+    instruction_type: [bne, jr, jal]
+
+    When matched, returns:
+    - The row indices where the instruction appears
+    - The indices of any bypass annotations whose source or target
+      row has such an instruction (so they can be highlighted)
+
+    Designed to flag control hazards by finding branches and jumps
+    and highlighting their associated bypass connections.
+    """
+
+    def __init__(self, instruction_types: List[str]):
+        self.instruction_types: Set[str] = {t.lower() for t in instruction_types}
+
+    def evaluate(self, ctx: EvalContext) -> ConditionResult:
+        matching_rows = [
+            row for row, instr in ctx.instructions.items()
+            if instr and instr.name.lower() in self.instruction_types
+        ]
+
+        if not matching_rows:
+            return ConditionResult(matched=False)
+
+        matching_row_set = set(matching_rows)
+        annotation_indices = [
+            i for i, a in enumerate(ctx.bypass_annotations)
+            if a.source[0] in matching_row_set
+            or a.target[0] in matching_row_set
+        ]
+
+        return ConditionResult(
+            matched=True,
+            rows=sorted(matching_rows),
+            annotation_indices=annotation_indices,
+        )
+
+
+class NeverCondition:
+    """
+    Fallback for unrecognised condition types.  Never matches.
+    Allows configs with unknown conditions to load without crashing.
+    """
+
+    def evaluate(self, ctx: EvalContext) -> ConditionResult:
+        return ConditionResult(matched=False)
+
+
+# ---------------------------------------------------------------------------
+# Condition factory
+# ---------------------------------------------------------------------------
+
+def build_condition(when_block: Dict):
+    """
+    Parse a 'when' dict from a YAML rule and return the appropriate
+    condition object.
+
+    Supported keys:
+        all:                  list of sub-condition dicts → AllCondition
+        bypass_exists:        bool → BypassExistsCondition
+        dependency_detected:  str  → DependencyDetectedCondition
+        grid_cell_overlapping: bool → GridCellOverlappingCondition
+        instruction_type:     str or list → InstructionTypeCondition
+
+    Unknown keys produce a UserWarning and return NeverCondition.
+
+    Args:
+        when_block: The parsed 'when:' dict from a YAML rule entry.
+
+    Returns:
+        A condition object with an evaluate(EvalContext) -> ConditionResult
+        method.
+    """
+    if 'all' in when_block:
+        sub_conditions = []
+        for item in when_block['all']:
+            if isinstance(item, dict):
+                sub_conditions.append(build_condition(item))
+        return AllCondition(sub_conditions)
+
+    if 'bypass_exists' in when_block:
+        return BypassExistsCondition(bool(when_block['bypass_exists']))
+
+    if 'dependency_detected' in when_block:
+        return DependencyDetectedCondition(str(when_block['dependency_detected']))
+
+    if 'grid_cell_overlapping' in when_block:
+        return GridCellOverlappingCondition(bool(when_block['grid_cell_overlapping']))
+
+    if 'instruction_type' in when_block:
+        types = when_block['instruction_type']
+        if isinstance(types, str):
+            types = [types]
+        return InstructionTypeCondition(list(types))
+
+    warnings.warn(
+        f"build_condition: unrecognised condition keys {list(when_block.keys())}; "
+        f"rule will never fire.",
+        UserWarning,
+        stacklevel=2,
+    )
+    return NeverCondition()
+
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+class HighlightAction:
+    """
+    Produces a Violation that instructs the frontend to highlight specific
+    elements.
+
+    target == 'bypass_annotation': highlight SVG arrow elements by index
+    target == 'grid_cell':         highlight grid cell divs by coordinate
+
+    The color is looked up from bypass_type_colors at build time so the
+    action carries the resolved hex string rather than a symbolic reference.
+    """
+
+    def __init__(self, target: str, color: str):
+        """
+        Args:
+            target: 'bypass_annotation' or 'grid_cell'
+            color:  Resolved hex color string for the highlight
+        """
+        self.target = target
+        self.color  = color
+
+    def execute(self,
+                rule_name: str,
+                result:    ConditionResult) -> List[Violation]:
+        """
+        Convert a ConditionResult into a list of Violation objects.
+
+        Returns a single Violation containing all affected items, or an
+        empty list if the result has no affected items to highlight.
+
+        Args:
+            rule_name: Name of the parent rule (used in Violation.rule_name)
+            result:    ConditionResult from the condition evaluation
+
+        Returns:
+            List[Violation]: Zero or one Violation.
+        """
+        if self.target == 'bypass_annotation':
+            if not result.annotation_indices:
+                return []
+            return [Violation(
+                rule_name=rule_name,
+                cells=[],
+                rows=result.rows,
+                message=rule_name,
+                annotation_indices=result.annotation_indices,
+                highlight_color=self.color,
+            )]
+
+        if self.target == 'grid_cell':
+            if not result.cells:
+                return []
+            return [Violation(
+                rule_name=rule_name,
+                cells=result.cells,
+                rows=result.rows,
+                message=rule_name,
+                annotation_indices=[],
+                highlight_color=self.color,
+            )]
+
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Action factory
+# ---------------------------------------------------------------------------
+
+def build_action(then_block: Dict,
+                 bypass_type_colors: Dict[str, str]) -> HighlightAction:
+    """
+    Parse a 'then' dict from a YAML rule and return the appropriate
+    action object.
+
+    Currently only the 'highlight' action type is supported.
+    color_ref must match a key in bypass_type_colors; falls back to
+    '#cccccc' (gray) if not found.
+
+    Args:
+        then_block:         The parsed 'then:' dict from a YAML rule entry
+        bypass_type_colors: Maps bypass type name to hex color string;
+                            from {bt.name: bt.color for bt in config.to_bypass_types()}
+
+    Returns:
+        HighlightAction instance.
+    """
+    action    = then_block.get('action', {})
+    target    = action.get('target', 'grid_cell')
+    color_ref = action.get('color_ref', '')
+    color     = bypass_type_colors.get(color_ref, '#cccccc')
+    return HighlightAction(target=target, color=color)
+
+
+# ---------------------------------------------------------------------------
+# Abstract Rule base
 # ---------------------------------------------------------------------------
 
 class Rule(ABC):
     """
     Abstract base class for all pipeline scheduling rules.
 
-    Concrete subclasses must implement check().  Instances are created
-    by RuleChecker.load_rules_from_config() based on the 'type' field
-    in each YAML rule definition, or manually via RuleChecker.add_rule()
-    for programmatic use.
+    Both WhenThenRule (new YAML format) and ColumnConstraintRule (old
+    format) inherit from this class.  RuleChecker calls check() on all
+    enabled rules and aggregates their violations.
     """
 
     def __init__(self, name: str, description: str, enabled: bool = True):
         """
-        Initialise a rule.
-
         Args:
-            name:        Human-readable rule name; used as the key in
-                         set_rule_enabled() lookups
-            description: Detailed description displayed in the rules panel
-            enabled:     If False the rule is skipped in check_all()
+            name:        Rule name; used as the key in set_rule_enabled()
+            description: Description shown in the rules panel
+            enabled:     False means the rule is skipped in check_all()
         """
         self.name:        str  = name
         self.description: str  = description
@@ -82,62 +466,88 @@ class Rule(ABC):
 
     @abstractmethod
     def check(self,
-              grid_data:    Dict[Tuple[int, int], str],
-              instructions: Dict[int, 'Instruction'],
-              rows:         int,
-              cols:         int) -> List[Violation]:
+              grid_data:          Dict[Tuple[int, int], str],
+              instructions:       Dict[int, 'Instruction'],
+              rows:               int,
+              cols:               int,
+              bypass_annotations: List[Any] = None) -> List[Violation]:
         """
-        Evaluate the rule against the current grid state.
+        Evaluate the rule against the current scheduler state.
 
         Args:
-            grid_data:    Maps (row, col) tuples to block type strings
-            instructions: Maps row numbers to Instruction instances
-            rows:         Current number of grid rows
-            cols:         Current number of grid columns
+            grid_data:          Maps (row, col) to block type string
+            instructions:       Maps row index to Instruction instance
+            rows:               Current grid row count
+            cols:               Current grid column count
+            bypass_annotations: List of BypassAnnotation instances;
+                                 None is treated as empty list
 
         Returns:
-            List[Violation]: All violations found; empty list if none
+            List[Violation]: All violations found; empty list if none.
         """
 
 
 # ---------------------------------------------------------------------------
-# ColumnConstraintRule
+# WhenThenRule
+# ---------------------------------------------------------------------------
+
+class WhenThenRule(Rule):
+    """
+    A rule defined by a declarative 'when' condition and 'then' action
+    parsed from the new YAML format.
+
+    The condition is built by build_condition() and the action by
+    build_action() at config-load time.  check() evaluates the condition
+    against the current EvalContext and, if matched, executes the action
+    to produce Violation objects.
+    """
+
+    def __init__(self,
+                 name:      str,
+                 description: str,
+                 enabled:   bool,
+                 condition,
+                 action:    HighlightAction):
+        """
+        Args:
+            name:        Rule name
+            description: Rule description
+            enabled:     Initial enabled state
+            condition:   Any object with evaluate(EvalContext) -> ConditionResult
+            action:      HighlightAction instance
+        """
+        super().__init__(name, description, enabled)
+        self.condition = condition
+        self.action    = action
+
+    def check(self,
+              grid_data:          Dict[Tuple[int, int], str],
+              instructions:       Dict[int, 'Instruction'],
+              rows:               int,
+              cols:               int,
+              bypass_annotations: List[Any] = None) -> List[Violation]:
+        """Evaluate condition; if matched, execute action."""
+        bypass_annotations = bypass_annotations or []
+        ctx    = EvalContext(grid_data, instructions, rows, cols, bypass_annotations)
+        result = self.condition.evaluate(ctx)
+        if not result.matched:
+            return []
+        return self.action.execute(self.name, result)
+
+
+# ---------------------------------------------------------------------------
+# ColumnConstraintRule (retained for backward compatibility)
 # ---------------------------------------------------------------------------
 
 class ColumnConstraintRule(Rule):
     """
-    Generic rule that enforces per-column stage capacity limits defined
-    in the YAML config.
+    Retained for backward compatibility with configs that include a
+    'pipeline.stages' section and use 'type: column_constraint' rules.
 
-    Interprets a 'logic' dict from the config at runtime.  The expected
-    YAML structure for the logic block is:
+    Enforces per-column stage capacity limits.  Stages with capacity 0
+    are unbounded (exempt from checking).
 
-        logic:
-          scope: "column"
-          target: "grid_data"
-          constraint:
-            group_by: "stage"
-            limit:
-              from: "pipeline.stages"
-              key:  "stage"
-            ignore_if:
-              capacity_equals: 0
-            violation_message: >
-              Stage '{stage}' exceeds its allowed capacity ({capacity})
-              in column {col}.
-
-    Fields used at runtime:
-        constraint.ignore_if.capacity_equals
-            Stages whose capacity in stage_capacities equals this value
-            are exempt from checking.  Set to 0 in the default config
-            to mark unbounded stages (e.g. 'i', 'r').
-        constraint.violation_message
-            Template string; {stage}, {col}, {capacity} are substituted.
-
-    Fields present for documentation / future extensibility but not
-    currently interpreted:
-        scope, target, constraint.group_by,
-        constraint.limit.from, constraint.limit.key
+    See the original rules.py for full documentation of this class.
     """
 
     def __init__(self,
@@ -146,69 +556,24 @@ class ColumnConstraintRule(Rule):
                  enabled:          bool,
                  logic:            Dict,
                  stage_capacities: Dict[str, int]):
-        """
-        Create a ColumnConstraintRule.
-
-        Args:
-            name:             Rule name (from YAML 'name' field)
-            description:      Rule description (from YAML 'description')
-            enabled:          Whether the rule is active (from YAML 'enabled')
-            logic:            The parsed 'logic' block from the YAML rule entry
-            stage_capacities: Maps stage name to absolute column capacity;
-                              from PipelineConfig.to_stage_capacities().
-                              A value of 0 marks the stage as unbounded.
-        """
         super().__init__(name, description, enabled)
-        self._logic:            Dict          = logic
+        self._logic:            Dict           = logic
         self._stage_capacities: Dict[str, int] = stage_capacities
 
     def update_stage_capacities(self, stage_capacities: Dict[str, int]) -> None:
-        """
-        Replace the stage capacity mapping without recreating the rule.
-
-        Called by RuleChecker.load_rules_from_config() when a new config
-        is loaded mid-session so existing rule instances are updated in
-        place rather than discarded and re-created.
-
-        Args:
-            stage_capacities: New mapping from PipelineConfig.to_stage_capacities()
-        """
         self._stage_capacities = stage_capacities
 
     def check(self,
-              grid_data:    Dict[Tuple[int, int], str],
-              instructions: Dict[int, 'Instruction'],
-              rows:         int,
-              cols:         int) -> List[Violation]:
-        """
-        Scan every column for stages that exceed their declared capacity.
+              grid_data:          Dict[Tuple[int, int], str],
+              instructions:       Dict[int, 'Instruction'],
+              rows:               int,
+              cols:               int,
+              bypass_annotations: List[Any] = None) -> List[Violation]:
 
-        For each column, groups all placed blocks by stage name, looks up
-        each stage's capacity in self._stage_capacities, and reports a
-        Violation when the block count in that column exceeds the limit.
-
-        Stages with a capacity equal to ignore_if.capacity_equals (typically 0)
-        are skipped entirely, making them unbounded.
-
-        Stages present in grid_data but absent from stage_capacities are
-        also skipped silently so that unknown block types do not cause errors.
-
-        Args:
-            grid_data:    Maps (row, col) to block type string
-            instructions: Not used by this rule; present to satisfy the ABC
-            rows:         Number of rows to evaluate
-            cols:         Number of columns to evaluate
-
-        Returns:
-            List[Violation]: One entry per (stage, column) pair that exceeds
-                             its capacity limit
-        """
         constraint      = self._logic.get('constraint', {})
         ignore_if       = constraint.get('ignore_if', {})
         ignore_capacity = ignore_if.get('capacity_equals')
-
-        # Strip leading/trailing whitespace from YAML block scalars
-        violation_template: str = str(constraint.get(
+        violation_template = str(constraint.get(
             'violation_message',
             "Stage '{stage}' exceeds its allowed capacity ({capacity}) "
             "in column {col}."
@@ -217,7 +582,6 @@ class ColumnConstraintRule(Rule):
         violations: List[Violation] = []
 
         for col in range(cols):
-            # Group all blocks in this column by stage name
             stage_positions: Dict[str, List[Tuple[int, int]]] = {}
             for row in range(rows):
                 cell = (row, col)
@@ -227,15 +591,10 @@ class ColumnConstraintRule(Rule):
 
             for stage, positions in stage_positions.items():
                 capacity: Optional[int] = self._stage_capacities.get(stage)
-
-                # Stage not declared in config — skip silently
                 if capacity is None:
                     continue
-
-                # Honour the ignore_if.capacity_equals exemption from YAML
                 if ignore_capacity is not None and capacity == ignore_capacity:
                     continue
-
                 if len(positions) > capacity:
                     affected_rows = sorted({pos[0] for pos in positions})
                     message = (violation_template
@@ -260,94 +619,79 @@ class RuleChecker:
     """
     Manages and evaluates all registered pipeline rules.
 
-    Rules are loaded from a PipelineConfig via load_rules_from_config()
-    rather than being registered at construction time.  A freshly
-    constructed RuleChecker has no rules until that method is called.
-
-    New rule types can be added to _RULE_TYPE_REGISTRY without modifying
-    load_rules_from_config(); the method dispatches based on the dict.
+    Detects the rule format from the YAML structure:
+    - Rules with 'when' and 'then' keys → WhenThenRule
+    - Rules with 'type: column_constraint' → ColumnConstraintRule
+    - Unknown formats → warning + skip
     """
-
-    # Maps YAML 'type' strings to the Rule subclass that handles them.
-    # Extend this dict when new rule types are introduced.
-    _RULE_TYPE_REGISTRY: Dict[str, type] = {
-        'column_constraint': ColumnConstraintRule,
-    }
 
     def __init__(self):
         self.rules: List[Rule] = []
 
-    # ------------------------------------------------------------------
-    # Config-driven rule loading
-    # ------------------------------------------------------------------
-
     def load_rules_from_config(self, config: 'PipelineConfig') -> None:
         """
-        Clear existing rules and register rules defined in the config.
+        Clear existing rules and register rules from the config.
 
-        Iterates over config.to_rule_definitions() and instantiates the
-        Rule subclass registered under the 'type' field of each entry.
-
-        If the 'type' value is not present in _RULE_TYPE_REGISTRY, a
-        UserWarning is issued and the rule is skipped so that a config with
-        one unsupported rule type still loads all other rules correctly.
+        Builds bypass_type_colors from the config's bypass types so that
+        WhenThenRule actions can resolve color_ref names to hex strings
+        without needing a reference back to the config at check time.
 
         Args:
-            config: A validated PipelineConfig instance whose
-                    to_rule_definitions() and to_stage_capacities() methods
-                    are used to build rules.
+            config: A validated PipelineConfig instance.
         """
         self.rules.clear()
+
+        bypass_type_colors = {
+            bt.name: bt.color
+            for bt in config.to_bypass_types()
+        }
         stage_capacities = config.to_stage_capacities()
 
         for rule_def in config.to_rule_definitions():
-            rule_type = rule_def.get('type', '')
             rule_name = rule_def.get('name', '<unnamed>')
+            description = str(rule_def.get('description', '')).strip()
+            enabled     = bool(rule_def.get('enabled', True))
 
-            if rule_type not in self._RULE_TYPE_REGISTRY:
-                warnings.warn(
-                    f"RuleChecker: unknown rule type '{rule_type}' for rule "
-                    f"'{rule_name}'; skipping.",
-                    UserWarning,
-                    stacklevel=2,
-                )
+            # ── New declarative format ──────────────────────────────
+            if 'when' in rule_def and 'then' in rule_def:
+                condition = build_condition(rule_def['when'])
+                action    = build_action(rule_def['then'], bypass_type_colors)
+                self.rules.append(WhenThenRule(
+                    name=rule_name,
+                    description=description,
+                    enabled=enabled,
+                    condition=condition,
+                    action=action,
+                ))
                 continue
 
-            rule_class = self._RULE_TYPE_REGISTRY[rule_type]
-
-            if rule_class is ColumnConstraintRule:
-                rule: Rule = ColumnConstraintRule(
+            # ── Legacy column_constraint format ─────────────────────
+            rule_type = rule_def.get('type', '')
+            if rule_type == 'column_constraint':
+                self.rules.append(ColumnConstraintRule(
                     name=rule_name,
-                    description=str(rule_def.get('description', '')).strip(),
-                    enabled=bool(rule_def.get('enabled', True)),
+                    description=description,
+                    enabled=enabled,
                     logic=rule_def.get('logic', {}),
                     stage_capacities=stage_capacities,
-                )
-            else:
-                # Generic path for future Rule subclasses that only need
-                # the three standard base constructor arguments.
-                rule = rule_class(
-                    name=rule_name,
-                    description=str(rule_def.get('description', '')).strip(),
-                    enabled=bool(rule_def.get('enabled', True)),
-                )
+                ))
+                continue
 
-            self.rules.append(rule)
-
-    # ------------------------------------------------------------------
-    # Rule management
-    # ------------------------------------------------------------------
+            # ── Unknown format ──────────────────────────────────────
+            warnings.warn(
+                f"RuleChecker: rule '{rule_name}' has no recognised format "
+                f"(expected 'when'+'then' or 'type: column_constraint'); "
+                f"skipping.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def add_rule(self, rule: Rule) -> None:
         """
-        Manually append a rule to the checker.
-
-        Intended for testing or for adding rules programmatically that
-        are not derived from a config file.  Rules added this way are
-        cleared the next time load_rules_from_config() is called.
+        Manually append a rule.  Cleared on the next load_rules_from_config call.
 
         Args:
-            rule: Any Rule subclass instance
+            rule: Any Rule subclass instance.
         """
         self.rules.append(rule)
 
@@ -356,10 +700,7 @@ class RuleChecker:
         Return metadata for all registered rules.
 
         Returns:
-            List[Dict]: One dict per rule containing:
-                'name'        (str):  Rule name
-                'description' (str):  Rule description
-                'enabled'     (bool): Current enabled state
+            List[Dict]: Each dict contains name, description, enabled.
         """
         return [
             {
@@ -374,13 +715,8 @@ class RuleChecker:
         """
         Enable or disable a rule by name.
 
-        Args:
-            rule_name: Exact rule name string as it was registered
-            enabled:   True to enable, False to disable
-
         Returns:
-            bool: True if a matching rule was found and updated,
-                  False if no rule with that name exists
+            bool: True if found and updated; False if not found.
         """
         for rule in self.rules:
             if rule.name == rule_name:
@@ -389,46 +725,36 @@ class RuleChecker:
         return False
 
     def set_all_enabled(self, enabled: bool) -> None:
-        """
-        Enable or disable all registered rules at once.
-
-        Args:
-            enabled: True to enable all rules, False to disable all
-        """
+        """Enable or disable all rules."""
         for rule in self.rules:
             rule.enabled = enabled
 
-    # ------------------------------------------------------------------
-    # Rule evaluation
-    # ------------------------------------------------------------------
-
     def check_all(self,
-                  grid_data:    Dict[Tuple[int, int], str],
-                  instructions: Dict[int, 'Instruction'],
-                  rows:         int,
-                  cols:         int) -> List[Violation]:
+                  grid_data:          Dict[Tuple[int, int], str],
+                  instructions:       Dict[int, 'Instruction'],
+                  rows:               int,
+                  cols:               int,
+                  bypass_annotations: List[Any] = None) -> List[Violation]:
         """
         Run all enabled rules and aggregate their violations.
 
-        The pipeline_count parameter from the previous version has been
-        removed.  Stage capacities are now absolute values supplied
-        directly by the config rather than being scaled at check time.
-
         Args:
-            grid_data:    Maps (row, col) tuples to block type strings
-            instructions: Maps row numbers to Instruction instances
-            rows:         Current grid row count
-            cols:         Current grid column count
+            grid_data:          Maps (row, col) to block type string
+            instructions:       Maps row index to Instruction instance
+            rows:               Current grid row count
+            cols:               Current grid column count
+            bypass_annotations: List of BypassAnnotation instances;
+                                 defaults to empty list
 
         Returns:
-            List[Violation]: All violations from all enabled rules,
-                             in the order rules were registered
+            List[Violation]: All violations from all enabled rules.
         """
+        bypass_annotations = bypass_annotations or []
         all_violations: List[Violation] = []
         for rule in self.rules:
             if not rule.enabled:
                 continue
             all_violations.extend(
-                rule.check(grid_data, instructions, rows, cols)
+                rule.check(grid_data, instructions, rows, cols, bypass_annotations)
             )
         return all_violations

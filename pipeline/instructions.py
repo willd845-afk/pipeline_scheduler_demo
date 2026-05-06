@@ -31,36 +31,64 @@ from typing import Dict, List, Optional
 _instruction_formats: Dict[str, 'InstructionFormat'] = {}
 
 
+@dataclass
+class InstructionFormat:
+    """
+    Specification for one instruction type, built from the YAML config.
+
+    In the new YAML format, instruction_type and syntax are optional.
+    When syntax is not provided it is auto-generated from the instruction
+    name and its operand list in __post_init__.
+
+    Attributes:
+        name             (str):       Instruction mnemonic
+        operands         (List[str]): Ordered operand names
+        instruction_type (str):       Type string e.g. 'R_TYPE', or '' if
+                                      not specified in the YAML
+        syntax           (str):       Assembly template; auto-generated
+                                      from name + operands if empty
+    """
+    name:             str
+    operands:         List[str]
+    instruction_type: str  = ''
+    syntax:           str  = ''
+
+    def __post_init__(self):
+        # Auto-generate syntax when not explicitly provided.
+        # Produces e.g. 'add rd, rs1, rs2' from name='add',
+        # operands=['rd','rs1','rs2'].
+        if not self.syntax:
+            if self.operands:
+                self.syntax = f"{self.name} {', '.join(self.operands)}"
+            else:
+                self.syntax = self.name
+
+
 def set_instruction_formats(formats: Dict[str, Dict]) -> None:
     """
     Populate the instruction format registry from a config dict.
 
-    Clears any previously registered formats and rebuilds the registry
-    from the supplied dict.  Must be called before any Instruction
-    instances are created so that their format lookups succeed.
-
-    Called by PipelineScheduler.load_config() each time a new config
-    file is applied.
+    Handles configs produced by both the old YAML format (which includes
+    'type' and 'format' fields) and the new format (which only requires
+    'operands').
 
     Args:
         formats: Dict returned by PipelineConfig.to_instruction_formats().
-                 Each key is an instruction mnemonic (str); each value is
-                 a dict with the keys:
-                     'type'     (str):       Instruction type string,
-                                             e.g. 'R_TYPE'
-                     'operands' (List[str]): Ordered operand names,
-                                             e.g. ['rd', 'rs1', 'rs2']
-                     'syntax'   (str):       Display format template,
-                                             e.g. 'add rd, rs1, rs2'
+                 Each value has keys 'operands' (required), 'type'
+                 (optional, defaults to ''), and 'syntax' (optional;
+                 InstructionFormat.__post_init__ auto-generates if absent).
     """
     global _instruction_formats
     _instruction_formats.clear()
     for name, fmt in formats.items():
+        operands = list(fmt.get('operands', []))
+        # syntax may be empty string; InstructionFormat.__post_init__
+        # will generate it automatically in that case
         _instruction_formats[name] = InstructionFormat(
             name=name,
+            operands=operands,
             instruction_type=fmt.get('type', ''),
-            operands=list(fmt.get('operands', [])),
-            syntax=fmt.get('syntax', name),
+            syntax=fmt.get('syntax', ''),
         )
 
 
@@ -74,36 +102,6 @@ def get_instruction_formats() -> Dict[str, 'InstructionFormat']:
                                       has not been called yet.
     """
     return _instruction_formats
-
-
-# ---------------------------------------------------------------------------
-# InstructionFormat
-# ---------------------------------------------------------------------------
-
-@dataclass
-class InstructionFormat:
-    """
-    Specification for one instruction type, built from the YAML config.
-
-    Attributes:
-        name             (str):       Instruction mnemonic, e.g. 'add'
-        instruction_type (str):       One of the strings in
-                                      VALID_INSTRUCTION_TYPES, e.g. 'R_TYPE'.
-                                      Plain string rather than an enum
-                                      (Option A of the refactoring plan).
-        operands         (List[str]): Ordered operand names,
-                                      e.g. ['rd', 'rs1', 'rs2']
-        syntax           (str):       Assembly template string used by
-                                      Instruction.to_assembly().
-                                      Operand names are substituted with
-                                      their concrete values at render time,
-                                      e.g. 'lw rd, imm(rs1)'
-    """
-    name:             str
-    instruction_type: str
-    operands:         List[str]
-    syntax:           str
-
 
 # ---------------------------------------------------------------------------
 # Instruction

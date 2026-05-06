@@ -13,19 +13,26 @@ removed.  Stage capacities are now defined per-stage in the YAML config.
 """
 
 from flask import Flask, render_template, jsonify, request
-
 from pipeline            import Instruction, PipelineScheduler
 from pipeline.config     import PipelineConfig
 
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Application startup — load config and create scheduler
+# Application startup — load config, surface warnings, create scheduler
 # ---------------------------------------------------------------------------
 
-_default_config = PipelineConfig.load_from_file()
-scheduler       = PipelineScheduler(config=_default_config)
+_default_config   = PipelineConfig.load_from_file()
+_startup_warnings = _default_config.get_warnings()
 
+if _startup_warnings:
+    for _w in _startup_warnings:
+        app.logger.warning(_w)
+
+scheduler = PipelineScheduler(config=_default_config)
+
+# Store startup warnings so GET /api/config can return them
+_startup_config_warnings: List[str] = _startup_warnings
 
 # ---------------------------------------------------------------------------
 # Page
@@ -248,16 +255,22 @@ def update_rules():
 # ---------------------------------------------------------------------------
 
 @app.route('/api/config', methods=['GET'])
+@app.route('/api/config', methods=['GET'])
 def get_config():
     """
     Return the currently loaded configuration as JSON.
 
+    Includes any warnings that were generated when the config was first
+    loaded (at startup or on the most recent Import Config call).
+    Warnings are non-blocking; the config is valid even when they are present.
+
     Returns:
-        JSON: Full config dict from PipelineConfig.to_dict():
-              meta, instruction_formats, bypass_types, stage_capacities,
-              block_types, rule_definitions, defaults.
+        JSON: Full config dict from PipelineConfig.to_dict() plus:
+              warnings (list): Warning strings from the most recent load.
     """
-    return jsonify(scheduler.config.to_dict())
+    data             = scheduler.config.to_dict()
+    data['warnings'] = _startup_config_warnings
+    return jsonify(data)
 
 
 @app.route('/api/config', methods=['POST'])
@@ -265,17 +278,14 @@ def upload_config():
     """
     Accept a .yaml file upload, validate it, and apply it to the scheduler.
 
-    Accepts multipart/form-data with a 'config' file field containing a
-    YAML file.  Validation errors are returned as a list in the response
-    body rather than raising an exception, so the frontend can display them.
-
-    On success, returns the full config dict (same shape as GET /api/config)
-    plus a 'success' key so the frontend can update all data structures
-    (block types, instruction formats, bypass types) in a single round trip.
+    On success the response includes a 'warnings' list in addition to the
+    full config dict.  Warnings are non-blocking notices such as a missing
+    start_state file or unreferenced JSON files in the config directory.
+    The frontend should display these to the user without blocking the reload.
 
     Returns:
-        JSON: config dict + {"success": true}                  HTTP 200
-        JSON: {"success": false, "errors": [str, ...]}         HTTP 400
+        JSON: config dict + {"success": true, "warnings": [...]}   HTTP 200
+        JSON: {"success": false, "errors": [...]}                  HTTP 400
     """
     if 'config' not in request.files:
         return jsonify({'success': False, 'errors': ['No file provided']}), 400
@@ -291,10 +301,18 @@ def upload_config():
     if errors:
         return jsonify({'success': False, 'errors': errors}), 400
 
-    scheduler.load_config(config)
+    config_warnings = config.get_warnings()
+    if config_warnings:
+        for w in config_warnings:
+            app.logger.warning(w)
 
-    response_data            = config.to_dict()
-    response_data['success'] = True
+    scheduler.load_config(config)
+    global _startup_config_warnings
+    _startup_config_warnings = config_warnings
+
+    response_data              = config.to_dict()
+    response_data['success']   = True
+    response_data['warnings']  = config_warnings
     return jsonify(response_data)
 
 

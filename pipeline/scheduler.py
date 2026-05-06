@@ -15,11 +15,10 @@ absolute limits with no multiplier.
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-
 from .config       import PipelineConfig, BypassType
 from .instructions import Instruction, set_instruction_formats
 from .rules        import RuleChecker
-
+import warnings as _warnings
 
 # ---------------------------------------------------------------------------
 # BypassAnnotation
@@ -136,30 +135,33 @@ class PipelineScheduler:
         bypass_annotations so that a mid-session config reload preserves
         the user's work.
 
-        If the config specifies a start_state JSON file under
-        defaults.start_state, that file is loaded as the initial grid
-        state.  Otherwise the default row/col dimensions from the config
-        are applied.
+        If start_state is defined but cannot be loaded (file missing or
+        invalid JSON), a UserWarning is issued and the scheduler falls back
+        to the default dimensions from the config.
 
         Args:
             config: A validated PipelineConfig instance.
         """
         self.config = config
 
-        # Populate the instruction format registry used by Instruction.__init__
         set_instruction_formats(config.to_instruction_formats())
-
-        # Replace bypass annotation types with those from the new config
         self.bypass_types = config.to_bypass_types()
-
-        # Rebuild the rule set from the new config definition
         self.rule_checker.load_rules_from_config(config)
 
-        # Apply default grid state or dimensions
         default_state = config.get_default_state()
         if default_state:
             self.load_state(default_state)
         else:
+            # Warn if start_state was defined but failed to load
+            start_state_path = config._defaults.get('start_state')
+            if start_state_path and isinstance(start_state_path, str):
+                _warnings.warn(
+                    f"PipelineScheduler: start_state '{start_state_path}' is "
+                    f"defined but could not be loaded. "
+                    f"Starting with an empty grid at default dimensions.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             self.rows = config.default_rows
             self.cols = config.default_cols
 
@@ -228,28 +230,39 @@ class PipelineScheduler:
 
     def check_rules(self) -> List[Dict]:
         """
-        Run all enabled rules against the current grid and return violations.
+        Run all enabled rules against the current scheduler state.
+
+        Passes bypass_annotations to the rule checker so WhenThenRule
+        instances (which operate on annotation labels) can evaluate correctly.
 
         Returns:
             List[Dict]: Each dict contains:
-                rule_name (str):          Name of the violated rule
-                cells (list):             [{"row": int, "col": int}, ...]
-                rows  (list):             Affected row numbers
-                message (str):            Human-readable description
-            Empty list if no violations are detected.
+                rule_name          (str):   Name of the violated rule
+                cells              (list):  [{"row": int, "col": int}, ...]
+                rows               (list):  Affected row indices
+                message            (str):   Human-readable description
+                annotation_indices (list):  Indices into bypass_annotations
+                                            whose SVG elements should be
+                                            highlighted
+                highlight_color    (str|None): Hex color for the highlight,
+                                            or null if no annotation highlight
+            Empty list if the schedule is valid.
         """
         violations = self.rule_checker.check_all(
             self.grid_data,
             self.instructions,
             self.rows,
             self.cols,
+            self.bypass_annotations,
         )
         return [
             {
                 'rule_name': v.rule_name,
-                'cells':     [{'row': c[0], 'col': c[1]} for c in v.cells],
-                'rows':      v.rows,
-                'message':   v.message,
+                'cells': [{'row': c[0], 'col': c[1]} for c in v.cells],
+                'rows': v.rows,
+                'message': v.message,
+                'annotation_indices': v.annotation_indices,
+                'highlight_color': v.highlight_color,
             }
             for v in violations
         ]

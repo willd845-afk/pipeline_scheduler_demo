@@ -34,6 +34,9 @@ import yaml
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH   = os.path.join(_PROJECT_ROOT, 'config', 'config.yaml')
 
+# Directory containing config.yaml and any state JSON files
+_CONFIG_DIR = os.path.join(_PROJECT_ROOT, 'config')
+
 # ---------------------------------------------------------------------------
 # Allowed instruction type strings
 # Option A: plain strings rather than an enum so that instruction_type is a
@@ -386,31 +389,169 @@ class PipelineConfig:
 
     def _validate_start_state(self) -> List[str]:
         """
-        Validate defaults.start_state if present.
-        Checks that the file exists and contains valid JSON.
+        Validate the start_state field type only.
+
+        File existence and JSON validity are non-blocking and are reported
+        as warnings via get_warnings() rather than blocking errors.
+        The only blocking error here is if start_state is set to a non-string
+        value (e.g. a dict or list), which indicates a malformed config.
+
+        Returns:
+            List[str]: One error string if start_state is the wrong type;
+                       empty list otherwise.
         """
         errors: List[str] = []
         start_state = self._defaults.get('start_state')
 
-        if not start_state:
+        # Absent or explicitly null — perfectly valid
+        if start_state is None or start_state is False:
             return errors
 
-        if not os.path.exists(start_state):
+        if not isinstance(start_state, str):
             errors.append(
-                f"defaults.start_state: path '{start_state}' does not exist"
-            )
-            return errors
-
-        try:
-            with open(start_state, 'r', encoding='utf-8') as fh:
-                json.load(fh)
-        except json.JSONDecodeError as exc:
-            errors.append(
-                f"defaults.start_state: '{start_state}' is not valid "
-                f"JSON — {exc}"
+                f"defaults.start_state must be a string path, "
+                f"got {type(start_state).__name__}"
             )
 
         return errors
+
+    def get_warnings(self) -> List[str]:
+        """
+        Return non-blocking warnings about the config state.
+
+        Unlike validate(), warnings do not prevent the config from loading.
+        They are surfaced to the user via the terminal at startup and via
+        the API response on Import Config so the user can investigate without
+        the application refusing to start.
+
+        Current checks:
+            - start_state defined but the file is missing or unreadable
+            - start_state defined but the file contains invalid JSON
+            - JSON files found in the config directory that are not
+              referenced by start_state (potential forgotten state files)
+
+        Returns:
+            List[str]: Warning strings in the order they were found.
+                       Empty list if no issues are detected.
+        """
+        found: List[str] = []
+        found.extend(self._warn_start_state())
+        found.extend(self._warn_unreferenced_json())
+        return found
+
+    def _warn_start_state(self) -> List[str]:
+        """
+        Return warnings related to the start_state path.
+
+        Produces a warning when start_state is defined but:
+        - the referenced file does not exist on disk, or
+        - the referenced file exists but contains invalid JSON.
+
+        In both cases the scheduler will fall back to an empty grid at
+        the default dimensions.  No warning is produced when start_state
+        is absent or null.
+
+        Returns:
+            List[str]: Zero, one, or two warning strings.
+        """
+        warnings_out: List[str] = []
+        start_state = self._defaults.get('start_state')
+
+        if not start_state or not isinstance(start_state, str):
+            return warnings_out
+
+        resolved = self._resolve_state_path(start_state)
+
+        if not os.path.exists(resolved):
+            warnings_out.append(
+                f"start_state '{start_state}' is defined in defaults but "
+                f"the file does not exist at '{resolved}'. "
+                f"The grid will start empty."
+            )
+            return warnings_out
+
+        try:
+            with open(resolved, 'r', encoding='utf-8') as fh:
+                json.load(fh)
+        except json.JSONDecodeError as exc:
+            warnings_out.append(
+                f"start_state '{start_state}' exists but contains invalid "
+                f"JSON ({exc}). The grid will start empty."
+            )
+
+        return warnings_out
+
+    def _warn_unreferenced_json(self) -> List[str]:
+        """
+        Return warnings for JSON files in the config directory that are
+        not referenced by defaults.start_state.
+
+        Scans _CONFIG_DIR (project_root/config/) for .json files and
+        compares each one against the resolved start_state path.  Any
+        .json file that exists in the directory but is not referenced
+        produces a warning so the user can decide whether to wire it up
+        as a start_state or delete it.
+
+        Silently skips the scan if the config directory does not exist or
+        cannot be read.
+
+        Returns:
+            List[str]: One warning string per unreferenced .json file,
+                       sorted alphabetically.
+        """
+        warnings_out: List[str] = []
+
+        # Resolve the referenced start_state path to an absolute path
+        start_state = self._defaults.get('start_state')
+        referenced_abs: Optional[str] = None
+        if start_state and isinstance(start_state, str):
+            referenced_abs = self._resolve_state_path(start_state)
+
+        # Scan the config directory
+        try:
+            all_files = os.listdir(_CONFIG_DIR)
+        except (FileNotFoundError, PermissionError):
+            return warnings_out
+
+        json_files = sorted(f for f in all_files if f.lower().endswith('.json'))
+
+        for json_file in json_files:
+            full_abs = os.path.abspath(os.path.join(_CONFIG_DIR, json_file))
+
+            # Normalise both sides to avoid false positives from path style
+            # differences (e.g. ./config vs config on POSIX)
+            if referenced_abs and os.path.normcase(full_abs) == os.path.normcase(referenced_abs):
+                continue  # This is the referenced start_state — no warning
+
+            display_path = os.path.join('config', json_file)
+            warnings_out.append(
+                f"'{display_path}' is a JSON file in the config directory "
+                f"but is not referenced by defaults.start_state. "
+                f"Add 'start_state: ./{display_path}' to defaults if you "
+                f"want it to be loaded automatically."
+            )
+
+        return warnings_out
+
+    @staticmethod
+    def _resolve_state_path(path: str) -> str:
+        """
+        Resolve a start_state path to an absolute path.
+
+        Relative paths are resolved relative to the project root
+        (_PROJECT_ROOT) so that './config/foo.json' and 'config/foo.json'
+        both resolve correctly regardless of the working directory Flask
+        is launched from.
+
+        Args:
+            path: The raw start_state string from the YAML.
+
+        Returns:
+            str: Absolute path string.
+        """
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(os.path.join(_PROJECT_ROOT, path))
 
     # ------------------------------------------------------------------
     # Data accessors — used by other pipeline modules and Flask routes
@@ -510,21 +651,24 @@ class PipelineConfig:
         """
         Load and return the JSON state file referenced by defaults.start_state.
 
-        The JSON file uses the same format as the Save State / Load State
-        feature (grid_data, instructions, rows, cols, pipeline_annotations).
+        Uses _resolve_state_path so that relative paths work correctly
+        regardless of the working directory.
 
         Returns:
             dict:  Parsed state dict if the path is set and readable.
-            None:  If defaults.start_state is absent, the file does not exist,
-                   or the file contains invalid JSON.  Callers should treat
-                   None as "use empty defaults".
+            None:  If start_state is absent, the file does not exist, or
+                   the file contains invalid JSON.  Callers should treat
+                   None as "use empty defaults"; the warning about the
+                   missing file is surfaced separately via get_warnings().
         """
         start_state = self._defaults.get('start_state')
-        if not start_state:
+        if not start_state or not isinstance(start_state, str):
             return None
 
+        resolved = self._resolve_state_path(start_state)
+
         try:
-            with open(start_state, 'r', encoding='utf-8') as fh:
+            with open(resolved, 'r', encoding='utf-8') as fh:
                 return json.load(fh)
         except (FileNotFoundError, json.JSONDecodeError):
             return None
