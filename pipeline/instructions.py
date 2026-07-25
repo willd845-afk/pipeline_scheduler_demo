@@ -17,8 +17,7 @@ to_assembly() use string equality rather than enum membership tests.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
-
+from typing import Any, Dict, List, Optional, Set
 
 # ---------------------------------------------------------------------------
 # Module-level instruction format registry
@@ -34,61 +33,131 @@ _instruction_formats: Dict[str, 'InstructionFormat'] = {}
 @dataclass
 class InstructionFormat:
     """
-    Specification for one instruction type, built from the YAML config.
-
-    In the new YAML format, instruction_type and syntax are optional.
-    When syntax is not provided it is auto-generated from the instruction
-    name and its operand list in __post_init__.
+    Specification for one instruction type.
 
     Attributes:
-        name             (str):       Instruction mnemonic
+        name             (str): Instruction mnemonic
         operands         (List[str]): Ordered operand names
-        instruction_type (str):       Type string e.g. 'R_TYPE', or '' if
-                                      not specified in the YAML
-        syntax           (str):       Assembly template; auto-generated
-                                      from name + operands if empty
+        instruction_type (str): Type string e.g. 'R_TYPE', or ''
+        syntax           (str): Assembly template; auto-generated if empty
+        valid_path       (str): Pipeline sub-path e.g. 'ALU', 'MUL'
+        when_start       (str): Stage where execution begins e.g. 'X'
+        when_done        (str): Stage where result is available for
+                                 forwarding e.g. 'X'
+        values_committed (str): Stage where result is committed to the
+                                 architectural register file e.g. 'C'.
+                                 Used as the producer's hazard boundary
+                                 when no bypass is present.
+        decoded          (str): Stage where the instruction is decoded and
+                                 its operands become addressable e.g. 'D'.
+                                 Used as the lower bound for valid bypass
+                                 targets — a bypass to a stage before this
+                                 point cannot be used because the instruction
+                                 is not yet ready to receive forwarded data.
+        read_dependency  (str): Dependency category for reads e.g. 'reg_update'
+        write_dependency (str): Dependency category for writes e.g. 'reg_update'
     """
     name:             str
     operands:         List[str]
-    instruction_type: str  = ''
-    syntax:           str  = ''
+    instruction_type: str = ''
+    syntax:           str = ''
+    valid_path:       str = ''
+    when_start:       str = ''
+    when_done:        str = ''
+    values_committed: str = ''
+    decoded:          str = ''
+    read_dependency:  str = ''
+    write_dependency: str = ''
 
     def __post_init__(self):
-        # Auto-generate syntax when not explicitly provided.
-        # Produces e.g. 'add rd, rs1, rs2' from name='add',
-        # operands=['rd','rs1','rs2'].
         if not self.syntax:
-            if self.operands:
-                self.syntax = f"{self.name} {', '.join(self.operands)}"
-            else:
-                self.syntax = self.name
+            self.syntax = (
+                f"{self.name} {', '.join(self.operands)}"
+                if self.operands else self.name
+            )
+
+
+# ---------------------------------------------------------------------------
+# Register helpers
+#
+# Placed here (rather than rules.py) so that both rules.py and
+# dependency_graph.py can import them without creating a circular dependency.
+# ---------------------------------------------------------------------------
+
+def _get_written_reg_values(instruction: Any) -> Set[str]:
+    """
+    Return the set of concrete register values written by *instruction*.
+
+    Operand names starting with 'rd' are treated as write destinations.
+
+    Args:
+        instruction: An Instruction instance, or None / any object without
+                     a 'format' attribute.
+
+    Returns:
+        Set[str]: e.g. {'r1'}.  Empty set if the instruction is None or
+                  has no recognised write operands.
+    """
+    if not instruction or not getattr(instruction, 'format', None):
+        return set()
+    result: Set[str] = set()
+    for op_name in instruction.format.operands:
+        if op_name.startswith('rd'):
+            val = instruction.operands.get(op_name, '').strip()
+            if val:
+                result.add(val)
+    return result
+
+
+def _get_read_reg_values(instruction: Any) -> Set[str]:
+    """
+    Return the set of concrete register values read by *instruction*.
+
+    Operand names starting with 'rs' or 'rt', or exactly matching 'base'
+    or 'addr', are treated as read sources.
+
+    Args:
+        instruction: An Instruction instance, or None.
+
+    Returns:
+        Set[str]: e.g. {'r2', 'r3'}.  Empty set if None or no read operands.
+    """
+    if not instruction or not getattr(instruction, 'format', None):
+        return set()
+    _PREFIXES = ('rs', 'rt')
+    _EXACT    = frozenset({'base', 'addr'})
+    result: Set[str] = set()
+    for op_name in instruction.format.operands:
+        if op_name.startswith(_PREFIXES) or op_name in _EXACT:
+            val = instruction.operands.get(op_name, '').strip()
+            if val:
+                result.add(val)
+    return result
 
 
 def set_instruction_formats(formats: Dict[str, Dict]) -> None:
     """
     Populate the instruction format registry from a config dict.
 
-    Handles configs produced by both the old YAML format (which includes
-    'type' and 'format' fields) and the new format (which only requires
-    'operands').
-
     Args:
         formats: Dict returned by PipelineConfig.to_instruction_formats().
-                 Each value has keys 'operands' (required), 'type'
-                 (optional, defaults to ''), and 'syntax' (optional;
-                 InstructionFormat.__post_init__ auto-generates if absent).
     """
     global _instruction_formats
     _instruction_formats.clear()
     for name, fmt in formats.items():
         operands = list(fmt.get('operands', []))
-        # syntax may be empty string; InstructionFormat.__post_init__
-        # will generate it automatically in that case
         _instruction_formats[name] = InstructionFormat(
             name=name,
             operands=operands,
             instruction_type=fmt.get('type', ''),
             syntax=fmt.get('syntax', ''),
+            valid_path=fmt.get('valid_path', ''),
+            when_start=fmt.get('when_start', ''),
+            when_done=fmt.get('when_done', ''),
+            values_committed=fmt.get('values_committed', ''),
+            decoded=fmt.get('decoded', ''),
+            read_dependency=fmt.get('read_dependency', ''),
+            write_dependency=fmt.get('write_dependency', ''),
         )
 
 

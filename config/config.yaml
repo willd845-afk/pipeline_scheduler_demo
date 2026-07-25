@@ -1,134 +1,201 @@
 meta:
-  name: "Default Pipeline Configuration"
-  description: "Baseline configuration for teaching pipelining concepts"
+  name: "Grid Pipeline Constraint DSL"
+  version: "1.0.3"
+  model_type: "constraint_validation_system"
+  description: >
+    Fully declarative rule system for validating user-authored
+    pipeline grid layouts. No simulation or execution semantics.
 
 # --------------------------------------------------
-# Instruction Set Definition
-# --------------------------------------------------
-instructions:
-  add:
-    type: R_TYPE
-    operands: [rd, rs1, rs2]
-    format: "add rd, rs1, rs2"
-
-  addi:
-    type: I_TYPE
-    operands: [rd, rs1, imm]
-    format: "addi rd, rs1, imm"
-
-  mul:
-    type: R_TYPE
-    operands: [rd, rs1, rs2]
-    format: "mul rd, rs1, rs2"
-
-  bne:
-    type: B_TYPE
-    operands: [rs1, rs2, imm]
-    format: "bne rs1, rs2, imm"
-
-  jr:
-    type: JR_TYPE
-    operands: [rs1]
-    format: "jr rs1"
-
-  lw:
-    type: I_TYPE
-    operands: [rd, rs1, imm]
-    format: "lw rd, imm(rs1)"
-
-  sw:
-    type: I_STORE
-    operands: [rs2, rs1, imm]
-    format: "sw rs2, imm(rs1)"
-
-  jal:
-    type: J_TYPE
-    operands: [rd, imm]
-    format: "jal rd, imm"
-
-# --------------------------------------------------
-# Hazard / Bypass Types
-# --------------------------------------------------
-bypass_types:
-  - name: RAW
-    color: "#cc0000"
-    description: "Read After Write"
-
-  - name: WAR
-    color: "#cc6600"
-    description: "Write After Read"
-
-  - name: WAW
-    color: "#9900cc"
-    description: "Write After Write"
-
-  - name: Control
-    color: "#006600"
-    description: "Control Dependency"
-
-  - name: Structural
-    color: "#0066cc"
-    description: "Structural Hazard"
-
-# --------------------------------------------------
-# Pipeline Stages
-# capacity: max instructions allowed (0 = unlimited)
+# PIPELINE STRUCTURE (SCHEDULING LATTICE)
 # --------------------------------------------------
 pipeline:
   stages:
-    F: 1
-    D: 1
-    i: 0
-    I: 1
-    Y0: 1
-    Y1: 1
-    Y2: 1
-    Y3: 1
-    W: 1
-    r: 0
-    C: 1
-    X: 1
+    1: [F(1), D(1), i(0), I(1)]
 
-# --------------------------------------------------
-# Default Simulation State (optional starting point)
-# --------------------------------------------------
-defaults:
-  rows: 10
-  cols: 10
-  start_state: './config/start_example.json'
+    2:
+      MUL:   [Y0(1), Y1(1), Y2(1), Y3(1)]
+      ALU:   [X(1)]
+      LOAD:  [L0(1), L1(1)]
+      STORE: [S(1)]
 
-# --------------------------------------------------
-# Rules System
-# --------------------------------------------------
+    3: [W(1), r(0), C(1)]
+
+instructions:
+
+  add:
+    operands: [rd, rs1, rs2]
+    valid_path: ALU
+    format: "add rd, rs1, rs2"
+    read_dependency:  reg_update
+    write_dependency: reg_update
+    when_start:       X   # execution begins here; consumer needs operands by this stage
+    when_done:        X   # result available for forwarding from this stage onward
+    values_committed: C   # result written to architectural register file here
+    decoded:          D   # operands become addressable here; earliest valid bypass target
+
 rules:
 
-  - name: "Unique Stage Per Column"
+  # ==================================================
+  # RAW DEPENDENCY RULE
+  # ==================================================
+  - name: "RAW Hazard"
+    type: "dependency_rule"
+    dep_class: "RAW"
     description: >
-      Ensures that each pipeline stage appears at most once per column,
-      unless the stage capacity is set to 0 (unbounded).
-      This models structural limits of pipeline hardware.
+      Detects Read After Write hazards. The dependency graph (driven by
+      write_dependency / read_dependency type matching) pre-filters iteration
+      to instruction pairs that share a register, so this when block only
+      needs to express the temporal constraint.
 
-    enabled: true
+      Violation fires when:
+        col(values_committed of producer) > col(when_start of consumer)
+        — the producer has not yet committed to the register file when the
+          consumer begins execution.
 
-    type: "column_constraint"
+      Resolved by a bypass annotation where:
+        source.col >= col(when_done of producer)     [from X or later]
+        col(decoded of consumer) <= target.col       [not before decode]
+        target.col < col(when_start of consumer)     [before execution]
 
-    logic:
-      scope: "column"
+      Valid paths for add: X→D, X→I, W→D, W→I
+    when:
+      all:
+        - temporal_hazard:
+            args: [producer, consumer]
+            producer_stage_attr: values_committed
+            consumer_stage_attr: when_start
+            operator: gte
+        - not:
+            temporal_bypass_exists:
+              args: [producer, consumer]
+              source_stage_attr:     when_done
+              target_min_stage_attr: decoded
+              target_max_stage_attr: when_start
+    then:
+      highlight:
+        type: "dependency"
+        label: "RAW"
+        color: "#cc0000"
 
-      # What we are checking
-      target: "grid_data"
+  # ==================================================
+  # WAR / WAW — infrastructure demo
+  # (uncomment and adjust stage attrs as needed)
+  # ==================================================
 
-      # Rule definition (designed to be interpretable, not code)
-      constraint:
-        group_by: "stage"
+  # - name: "WAW Hazard"
+  #   type: "dependency_rule"
+  #   dep_class: "WAW"
+  #   description: >
+  #     Both instructions write the same register (write_dependency matches).
+  #     Fires when producer commits after consumer commits, meaning the
+  #     register may end up holding the producer's (older) value.
+  #   when:
+  #     temporal_hazard:
+  #       args: [producer, consumer]
+  #       producer_stage_attr: values_committed
+  #       consumer_stage_attr: values_committed
+  #       operator: gt
+  #   then:
+  #     highlight:
+  #       label: "WAW"
+  #       color: "#9900cc"
 
-        limit:
-          from: "pipeline.stages"   # look up capacity from config
-          key: "stage"
+  # - name: "WAR Hazard"
+  #   type: "dependency_rule"
+  #   dep_class: "WAR"
+  #   description: >
+  #     Producer reads a register that consumer writes (read_dependency of
+  #     producer matches write_dependency of consumer). Fires when the
+  #     consumer writes before the producer has read, i.e.
+  #     col(when_done of consumer) < col(when_start of producer).
+  #   when:
+  #     temporal_hazard:
+  #       args: [consumer, producer]      # note: args reversed for WAR
+  #       producer_stage_attr: when_done
+  #       consumer_stage_attr: when_start
+  #       operator: lt
+  #   then:
+  #     highlight:
+  #       label: "WAR"
+  #       color: "#cc6600"
 
-        ignore_if:
-          capacity_equals: 0
+  # ==================================================
+  # PIPELINE SEQUENCE CONSTRAINT
+  # ==================================================
+  - name: "Pipeline Sequence Constraint"
+    type: "ordering_rule"
+    description: >
+      Ensures instruction progression follows the pipeline-defined stage order.
+      Fires when a later column holds a stage with a smaller pipeline depth
+      than the preceding column (backward movement).
+    when:
+      any:
+        - lt:
+            - stage_index(stage_of(current))
+            - stage_index(stage_of(previous))
+        - not:
+            in_pipeline_order:
+              args:
+                - stage_of(previous)
+                - stage_of(current)
+    then:
+      highlight:
+        type: "ordering_violation"
+        label: "SEQ"
+        color: "#006600"
 
-        violation_message: >
-          Stage '{stage}' exceeds its allowed capacity ({capacity})
-          in column {col}.
+  # ==================================================
+  # RESOURCE CAPACITY CONSTRAINT
+  # ==================================================
+  - name: "Resource Capacity Constraint"
+    type: "capacity_rule"
+    description: >
+      Ensures pipeline stage resources are not exceeded per column.
+      Stages with capacity 0 are unbounded and are never flagged.
+    when:
+      any:
+        - gt:
+            - resource_used(stage(current), column(current))
+            - stage_capacity(stage(current))
+    then:
+      highlight:
+        type: "resource_violation"
+        label: "CAP"
+        color: "#0066cc"
+
+# --------------------------------------------------
+# BYPASS MODEL (VISUAL ONLY — FUNCTIONALLY EQUIVALENT)
+# --------------------------------------------------
+bypass:
+
+  semantics: "uniform"
+
+  exists(a, b): true
+
+  annotation_only: true
+
+  colors:
+    RAW: "#cc0000"
+    WAR: "#cc6600"
+    WAW: "#9900cc"
+    CONTROL: "#006600"
+    STRUCTURAL: "#0066cc"
+
+# --------------------------------------------------
+# DEFAULT BEHAVIOR
+# --------------------------------------------------
+defaults:
+
+  evaluation_mode: "validation_only"
+
+  unknown_expression:
+    action: ignore
+
+  no_violation:
+    action: no_highlight
+
+  rows: 10
+  cols: 10
+
+  start_state: "./config/tiny_rv1_example.json"

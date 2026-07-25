@@ -55,10 +55,10 @@ function initPalette() {
         block.className = 'palette-block';
         block.textContent = blockType;
         block.draggable = true;
-        block.dataset.blockType
         block.dataset.blockType = blockType;
 
         block.addEventListener('dragstart', (e) => {
+            if (bypassAnnotationMode) exitPipelineMode();
             e.dataTransfer.setData('blockType', blockType);
             e.dataTransfer.setData('source', 'palette');
             block.classList.add('dragging');
@@ -66,14 +66,6 @@ function initPalette() {
 
         block.addEventListener('dragend', (e) => {
             block.classList.remove('dragging');
-        });
-
-        // Exit annotation mode when the user starts dragging a palette block
-        block.addEventListener('dragstart', (e) => {
-            if (bypassAnnotationMode) exitPipelineMode(); // NEW
-            e.dataTransfer.setData('blockType', blockType);
-            e.dataTransfer.setData('source', 'palette');
-            block.classList.add('dragging');
         });
 
         // Also exit if the user merely clicks a palette block (without dragging)
@@ -740,7 +732,6 @@ function loadState() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(state),
-                bypass_annotations: bypassAnnotations
             });
         };
         reader.readAsText(file);
@@ -1050,7 +1041,7 @@ async function handleBypassCellRightClick(row, col) {
         !(a.source.row === row && a.source.col === col) &&
         !(a.target.row === row && a.target.col === col)
     );
-
+    await checkRules();
     renderBypassAnnotations();
 }
 
@@ -1074,6 +1065,7 @@ async function saveBypassAnnotation(type, source, target) {
     if (data.success) {
         bypassAnnotations.push(data.annotation);
         renderBypassAnnotations();
+        await checkRules();
     }
 }
 
@@ -1137,7 +1129,6 @@ function renderBypassAnnotations() {
     });
 
     // ── Draw saved annotations ──
-    // ── Draw saved annotations ── (replace the existing forEach call)
     bypassAnnotations.forEach((a, idx) => {
         const overrideColor  = currentAnnotationHighlights[idx] || null;
         const isHighlighted  = idx in currentAnnotationHighlights;
@@ -1249,6 +1240,7 @@ async function deleteSpecificAnnotation(annotation) {
             target:          annotation.target,
             annotation_type: annotation.annotation_type
         })
+
     });
 
     // Sync client-side array
@@ -1260,7 +1252,8 @@ async function deleteSpecificAnnotation(annotation) {
           a.annotation_type === annotation.annotation_type)
     );
 
-    renderBypassAnnotations(); // Also calls renderAnnotationList
+    await checkRules();
+    renderBypassAnnotations()
 }
 
 /**

@@ -13,8 +13,11 @@ removed.  Stage capacities are now defined per-stage in the YAML config.
 """
 
 from flask import Flask, render_template, jsonify, request
-from pipeline            import Instruction, PipelineScheduler
+from pipeline            import Instruction
 from pipeline.config     import PipelineConfig
+from pipeline.debug_routes import debug_bp, init_debug_blueprint
+from pipeline.scheduler import PipelineScheduler
+from typing import List
 
 app = Flask(__name__)
 
@@ -29,7 +32,66 @@ if _startup_warnings:
     for _w in _startup_warnings:
         app.logger.warning(_w)
 
+# 2. Store scheduler in app.config so Blueprints can find it via current_app
+
 scheduler = PipelineScheduler(config=_default_config)
+app.config["SCHEDULER"] = scheduler          # same object, single source of truth
+
+init_debug_blueprint(scheduler)              # bind the live scheduler instance
+app.register_blueprint(debug_bp)            # register /api/debug/* routes
+
+# Store startup warnings so GET /api/config can return them
+_startup_config_warnings: List[str] = _startup_warnings
+
+def init_debug_blueprint(scheduler_instance) -> None:
+    """
+    Bind the debug blueprint to the live scheduler instance.
+
+    Must be called from app.py immediately after register_blueprint().
+
+    Args:
+        scheduler_instance: The PipelineScheduler object created at app startup.
+    """
+    global _scheduler_instance
+    _scheduler_instance = scheduler_instance
+
+
+def _scheduler():
+    """Return the bound scheduler, or raise a clear error if not initialised."""
+    if _scheduler_instance is None:
+        raise RuntimeError(
+            "Debug blueprint accessed before init_debug_blueprint() was called. "
+            "Add init_debug_blueprint(scheduler) to app.py after "
+            "register_blueprint(debug_bp)."
+        )
+    return _scheduler_instance
+
+# ---------------------------------------------------------------------------
+# Debug routes
+# Registered when the process is started with FLASK_DEBUG=1 or debug=True
+# in the run call.  The environment variable is readable at import time
+# unlike app.debug which is only set after app.run() is called.
+# ---------------------------------------------------------------------------
+# app.py — debug blueprint registration
+import os as _os
+
+_debug_active = (
+    _os.environ.get('FLASK_DEBUG', '').lower() in ('1', 'true', 'on')
+    or _os.environ.get('WERKZEUG_RUN_MAIN') == 'true'   # reloader child process
+    or app.debug
+)
+
+# if _debug_active:
+#     try:
+#         from pipeline.debug_routes import debug_bp, init_debug_blueprint
+#         app.register_blueprint(debug_bp)
+#         init_debug_blueprint(scheduler)   # ← pass the actual live object
+#         app.logger.info(
+#             "Debug routes registered at /api/debug/* "
+#             "(set FLASK_DEBUG=0 to disable)"
+#         )
+#     except Exception as _e:
+#         app.logger.warning(f"Could not register debug blueprint: {_e}")
 
 # Store startup warnings so GET /api/config can return them
 _startup_config_warnings: List[str] = _startup_warnings
@@ -255,7 +317,6 @@ def update_rules():
 # ---------------------------------------------------------------------------
 
 @app.route('/api/config', methods=['GET'])
-@app.route('/api/config', methods=['GET'])
 def get_config():
     """
     Return the currently loaded configuration as JSON.
@@ -417,6 +478,55 @@ def remove_bypass_annotation():
             int(data['row']), int(data['col'])
         )
     return jsonify({'success': True, 'removed': removed})
+
+@app.route('/api/graphs', methods=['GET'])
+def get_graphs():
+    """
+    Return the stage sequence graph and the register dependency graph.
+
+    dependency.nodes maps row index to instruction metadata including
+    parent/child RAW links, written/read register sets, when_start, and
+    when_done.  dependency.edges lists all RAW, WAW, and WAR edges with
+    the shared register names that create each dependency.
+
+    Returns:
+        JSON: {
+            "stage_sequence": {
+                "nodes":       [str, ...],
+                "edges":       {stage: [successor, ...], ...},
+                "stage_depth": {stage: int, ...},
+                "valid_paths": [[str, ...], ...]
+            } | null,
+            "dependency": {
+                "nodes": {
+                    "row_index": {
+                        "instruction_name": str,
+                        "write_dep_type":   str,
+                        "read_dep_type":    str,
+                        "when_start":       str,
+                        "when_done":        str,
+                        "written_regs":     [str, ...],
+                        "read_regs":        [str, ...],
+                        "parents":          [int, ...],
+                        "children":         [int, ...]
+                    }, ...
+                },
+                "edges": [
+                    {
+                        "producer_row":  int,
+                        "consumer_row":  int,
+                        "dep_class":     "RAW" | "WAW" | "WAR",
+                        "dep_type":      str,
+                        "shared_regs":   [str, ...]
+                    }, ...
+                ]
+            }
+        }
+    """
+    return jsonify({
+        'stage_sequence': scheduler.get_stage_sequence_graph(),
+        'dependency':     scheduler.build_dependency_graph(),
+    })
 
 
 if __name__ == '__main__':

@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 from .config       import PipelineConfig, BypassType
 from .instructions import Instruction, set_instruction_formats
 from .rules        import RuleChecker
+from .dependency_graph import DependencyGraph
 import warnings as _warnings
 
 # ---------------------------------------------------------------------------
@@ -118,6 +119,7 @@ class PipelineScheduler:
         self.bypass_types:       List[BypassType]           = []
         self.rule_checker:       RuleChecker                = RuleChecker()
         self.bypass_annotations: List[BypassAnnotation]     = []
+        self.dependency_graph: DependencyGraph = DependencyGraph()
 
         resolved_config = config or PipelineConfig.load_from_file()
         self.load_config(resolved_config)
@@ -230,30 +232,19 @@ class PipelineScheduler:
 
     def check_rules(self) -> List[Dict]:
         """
-        Run all enabled rules against the current scheduler state.
+        Rebuild the dependency graph then run all enabled rules.
 
-        Passes bypass_annotations to the rule checker so WhenThenRule
-        instances (which operate on annotation labels) can evaluate correctly.
-
-        Returns:
-            List[Dict]: Each dict contains:
-                rule_name          (str):   Name of the violated rule
-                cells              (list):  [{"row": int, "col": int}, ...]
-                rows               (list):  Affected row indices
-                message            (str):   Human-readable description
-                annotation_indices (list):  Indices into bypass_annotations
-                                            whose SVG elements should be
-                                            highlighted
-                highlight_color    (str|None): Hex color for the highlight,
-                                            or null if no annotation highlight
-            Empty list if the schedule is valid.
+        The dependency graph is always rebuilt here (rather than lazily)
+        so it reflects the latest operand values typed by the user.
         """
+        self.build_dependency_graph()
         violations = self.rule_checker.check_all(
             self.grid_data,
             self.instructions,
             self.rows,
             self.cols,
             self.bypass_annotations,
+            dep_graph=self.dependency_graph,
         )
         return [
             {
@@ -380,6 +371,273 @@ class PipelineScheduler:
                         source {row, col}, and target {row, col}.
         """
         return [a.to_dict() for a in self.bypass_annotations]
+
+    # ------------------------------------------------------------------
+    # Graph data
+    # ------------------------------------------------------------------
+
+    def get_stage_sequence_graph(self) -> Optional[Dict]:
+        """
+        Return the stage sequence graph as a JSON-serialisable dict.
+
+        Delegates to PipelineConfig.to_stage_sequence_graph(), which
+        builds the graph lazily on first call and caches it.
+
+        Returns:
+            dict with keys nodes, edges, stage_depth, valid_paths
+            when the config uses the new grouped pipeline.stages format.
+            None for old-format configs whose flat stage definition does
+            not encode ordering information.
+        """
+        if self.config is None:
+            return None
+        graph = self.config.to_stage_sequence_graph()
+        return graph.to_dict() if graph else None
+
+    def build_dependency_graph(self) -> Dict:
+        """
+        Rebuild and return the register dependency graph as a
+        JSON-serializable dict.
+
+        Always rebuilds from the current instruction set before returning
+        so the caller receives fresh data reflecting the latest operand
+        values typed by the user.
+
+        Returns:
+            dict with keys:
+                nodes (dict): Maps row index string to DepNode data
+                              including written_regs, read_regs,
+                              when_start, when_done, values_committed,
+                              decoded, parents, children.
+                edges (list): All RAW / WAW / WAR edges with shared_regs.
+        """
+        self.dependency_graph.build(self.instructions)
+        return self.dependency_graph.to_dict()
+
+    # ── add after build_dependency_graph() ────────────────────────────────────
+
+    def check_bypass_bounds(self, producer_row: int, consumer_row: int) -> Dict:
+        """
+        Validate every bypass annotation connecting producer_row → consumer_row
+        against the three column bounds derived from InstructionFormat attributes.
+
+        Mirrors the (corrected) logic in TemporalBypassExistsCondition so the
+        /api/debug/bypass-validation endpoint reports exactly which check fails.
+
+        Bounds for the default RAW config:
+            source.col >= col(when_done  of producer)
+            target.col >= col(decoded    of consumer)
+            target.col <  col(when_start of consumer)
+        """
+        prod_instr = self.instructions.get(producer_row)
+        cons_instr = self.instructions.get(consumer_row)
+
+        prod_fmt = getattr(prod_instr, 'format', None) if prod_instr else None
+        cons_fmt = getattr(cons_instr, 'format', None) if cons_instr else None
+
+        source_stage = getattr(prod_fmt, 'when_done', '') if prod_fmt else ''
+        target_min_stage = getattr(cons_fmt, 'decoded', '') if cons_fmt else ''
+        target_max_stage = getattr(cons_fmt, 'when_start', '') if cons_fmt else ''
+
+        def _find_col(row: int, stage: str) -> Optional[int]:
+            if not stage:
+                return None
+            return next(
+                (c for c in range(self.cols)
+                 if self.grid_data.get((row, c)) == stage),
+                None,
+            )
+
+        source_min_col = _find_col(producer_row, source_stage)
+        target_min_col = _find_col(consumer_row, target_min_stage)
+        target_max_col = _find_col(consumer_row, target_max_stage)
+
+        candidates = []
+        for ann in self.bypass_annotations:
+            if ann.source[0] != producer_row or ann.target[0] != consumer_row:
+                continue
+
+            src_col = ann.source[1]
+            tgt_col = ann.target[1]
+
+            check_src = source_min_col is None or src_col >= source_min_col
+            check_tgt_min = target_min_col is None or tgt_col >= target_min_col
+            check_tgt_max = target_max_col is None or tgt_col < target_max_col
+
+            if not check_src:
+                reason = (f"source col {src_col} < {source_min_col} "
+                          f"(need >= col of {source_stage})")
+            elif not check_tgt_min:
+                reason = (f"target col {tgt_col} < {target_min_col} "
+                          f"(need >= col of {target_min_stage})")
+            elif not check_tgt_max:
+                reason = (f"target col {tgt_col} >= {target_max_col} "
+                          f"(need < col of {target_max_stage})")
+            else:
+                reason = None
+
+            candidates.append({
+                'source': {'row': ann.source[0], 'col': ann.source[1]},
+                'target': {'row': ann.target[0], 'col': ann.target[1]},
+                'check_source_gte_min': check_src,
+                'check_target_gte_min': check_tgt_min,
+                'check_target_lt_max': check_tgt_max,
+                'valid': reason is None,
+                'failure_reason': reason,
+            })
+
+        return {
+            'producer_row': producer_row,
+            'consumer_row': consumer_row,
+            'bounds': {
+                'source_stage': source_stage,
+                'source_min_col': source_min_col,
+                'target_min_stage': target_min_stage,
+                'target_min_col': target_min_col,
+                'target_max_stage': target_max_stage,
+                'target_max_col': target_max_col,
+            },
+            'candidates': candidates,
+            'any_valid': any(c['valid'] for c in candidates),
+        }
+
+    def evaluate_rules_trace(self, rule_name: str) -> Optional[Dict]:
+        """
+        Trace a named dependency_rule binding-by-binding for the debug blueprint.
+        Dynamically extracts condition properties from YAML rules to support RAW,
+        WAW, and WAR trace validation.
+        """
+        from .rules import QuantifiedYAMLRule
+
+        target_rule = next(
+            (r for r in self.rule_checker.rules if r.name == rule_name),
+            None,
+        )
+        if target_rule is None:
+            return None
+
+        if not isinstance(target_rule, QuantifiedYAMLRule):
+            return {
+                'rule_name': rule_name,
+                'bindings_evaluated': 0,
+                'violations_emitted': 0,
+                'trace': [],
+                'note': 'Only dependency_rule types support tracing.',
+            }
+
+        self.dependency_graph.build(self.instructions)
+
+        # ── 1. Locate original YAML rule dictionary to extract attributes dynamically ──
+        rule_defs = self.config.to_rule_definitions()
+        raw_def = next((rd for rd in rule_defs if rd.get('name') == rule_name), {})
+
+        # Recursive search to locate 'temporal_hazard' sub-block inside nested 'all'/'any'/'not' YAML trees
+        def _find_temporal_hazard_def(block: Any) -> Optional[Dict]:
+            if not isinstance(block, dict):
+                return None
+            if 'temporal_hazard' in block:
+                return block['temporal_hazard']
+            for key in ['all', 'any']:
+                if key in block and isinstance(block[key], list):
+                    for sub in block[key]:
+                        found = _find_temporal_hazard_def(sub)
+                        if found:
+                            return found
+            if 'not' in block:
+                return _find_temporal_hazard_def(block['not'])
+            return None
+
+        hazard_def = _find_temporal_hazard_def(raw_def.get('when')) or {}
+
+        # Extract dynamic properties with fallbacks
+        dep_class = target_rule._dep_class or 'RAW'
+        prod_stage_attr = hazard_def.get('producer_stage_attr', 'values_committed')
+        cons_stage_attr = hazard_def.get('consumer_stage_attr', 'when_start')
+        operator_str = hazard_def.get('operator', 'gte')
+
+        _OPS = {
+            'gt': lambda a, b: a > b,
+            'gte': lambda a, b: a >= b,
+            'lt': lambda a, b: a < b,
+            'lte': lambda a, b: a <= b,
+        }
+        op_fn = _OPS.get(operator_str, _OPS['gte'])
+
+        trace = []
+        violations_emitted = 0
+
+        for edge in self.dependency_graph.get_edges_by_class(dep_class):
+            prod_row = edge.producer_row
+            cons_row = edge.consumer_row
+            prod_instr = self.instructions.get(prod_row)
+            cons_instr = self.instructions.get(cons_row)
+            if not prod_instr or not cons_instr:
+                continue
+
+            prod_fmt = getattr(prod_instr, 'format', None)
+            cons_fmt = getattr(cons_instr, 'format', None)
+
+            prod_stage_name = getattr(prod_fmt, prod_stage_attr, '') if prod_fmt else ''
+            cons_stage_name = getattr(cons_fmt, cons_stage_attr, '') if cons_fmt else ''
+
+            def _col(row: int, stage: str) -> Optional[int]:
+                if not stage:
+                    return None
+                return next(
+                    (c for c in range(self.cols)
+                     if self.grid_data.get((row, c)) == stage),
+                    None,
+                )
+
+            prod_col = _col(prod_row, prod_stage_name)
+            cons_col = _col(cons_row, cons_stage_name)
+
+            if prod_col is None or cons_col is None:
+                temporal_fires = False
+            else:
+                temporal_fires = op_fn(prod_col, cons_col)
+
+            # Re-use our trace validation check
+            bypass_info = self.check_bypass_bounds(prod_row, cons_row)
+            any_valid = bypass_info['any_valid']
+            violation = temporal_fires and not any_valid
+
+            if violation:
+                violations_emitted += 1
+
+            trace.append({
+                'producer_row': prod_row,
+                'consumer_row': cons_row,
+                'shared_regs': sorted(edge.shared_regs),
+                'temporal_hazard': {
+                    'producer_stage': prod_stage_name,
+                    'producer_col': prod_col,
+                    'consumer_stage': cons_stage_name,
+                    'consumer_col': cons_col,
+                    'result': temporal_fires,
+                },
+                'bypass_exists': {
+                    'any_valid': any_valid,
+                    'annotations_on_pair': [
+                        {
+                            'source': c['source'],
+                            'target': c['target'],
+                            'passes_source_bound': c['check_source_gte_min'],
+                            'passes_target_min': c['check_target_gte_min'],
+                            'passes_target_max': c['check_target_lt_max'],
+                        }
+                        for c in bypass_info['candidates']
+                    ],
+                },
+                'violation_emitted': violation,
+            })
+
+        return {
+            'rule_name': rule_name,
+            'bindings_evaluated': len(trace),
+            'violations_emitted': violations_emitted,
+            'trace': trace,
+        }
 
     # ------------------------------------------------------------------
     # State serialization

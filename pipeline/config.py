@@ -22,9 +22,147 @@ absolute column limit for that stage regardless of pipeline count.
 
 import json
 import os
+import re
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import yaml
+
+VALID_INSTRUCTION_TYPES: frozenset = frozenset({
+    'R_TYPE', 'I_TYPE', 'I_STORE', 'B_TYPE', 'J_TYPE', 'JR_TYPE',
+})
+
+# ---------------------------------------------------------------------------
+# Stage string pattern
+#
+# Matches 'F(1)', 'i*(0)', 'Y0(1)', 'r*(1)', etc.
+# Group 1: base name (letters + digits)
+# Group 2: optional '*' suffix  — retained as part of the stage name
+# Group 3: capacity integer
+# ---------------------------------------------------------------------------
+_STAGE_STR_RE = re.compile(r'^([A-Za-z][A-Za-z0-9]*)(\*)?\((\d+)\)$')
+
+
+def _parse_stage_str(s: str) -> Tuple[str, int]:
+    """
+    Parse a stage entry string of the form 'Name(capacity)' or 'Name*(capacity)'.
+
+    The optional '*' suffix is incorporated into the returned name:
+        'F(1)'   → ('F',  1)
+        'i*(0)'  → ('i*', 0)   # capacity 0 = unbounded
+        'Y0(1)'  → ('Y0', 1)
+        'r*(1)'  → ('r*', 1)
+
+    Args:
+        s: Raw stage string from the YAML config.
+
+    Returns:
+        Tuple[str, int]: (stage_name, capacity)
+
+    Raises:
+        ValueError: If the string does not match the expected pattern.
+    """
+    s = s.strip()
+    m = _STAGE_STR_RE.match(s)
+    if m:
+        name     = m.group(1) + (m.group(2) or '')
+        capacity = int(m.group(3))
+        return name, capacity
+    raise ValueError(
+        f"Cannot parse stage string '{s}': expected 'Name(capacity)'"
+        f" or 'Name*(capacity)', e.g. 'F(1)' or 'i*(0)'"
+    )
+
+
+# ---------------------------------------------------------------------------
+# StageSequenceGraph
+# ---------------------------------------------------------------------------
+
+class StageSequenceGraph:
+    """
+    Directed acyclic graph of all valid pipeline stage sequences.
+
+    Built from the pipeline.stages section by
+    PipelineConfig._build_stage_sequence_graph().  The graph models
+    sequential ordering within each stage group and parallel-path
+    semantics between sub-groups of the same group number.
+
+    Example for the reference config:
+        Group 1:  F → D → i* → I     (sequential)
+        Group 2:  I → {Y0→Y1→Y2→Y3, X, L0→L1, S}  (parallel paths)
+        Group 3:  {Y3,X,L1,S} → W → r* → C  (converging then sequential)
+
+    Attributes:
+        nodes        (List[str]):                All stage names, in order of
+                                                  first appearance.
+        edges        (Dict[str, List[str]]):      stage → [valid next stages]
+        predecessors (Dict[str, List[str]]):      stage → [preceding stages]
+        stage_depth  (Dict[str, int]):            stage → minimum BFS depth
+                                                  from root stages
+        group_of     (Dict[str, int]):            stage → YAML group number
+        subgroup_of  (Dict[str, Optional[str]]): stage → subgroup key or None
+        valid_paths  (List[List[str]]):           All root-to-leaf paths
+    """
+
+    def __init__(
+            self,
+            nodes:        List[str],
+            edges:        Dict[str, List[str]],
+            predecessors: Dict[str, List[str]],
+            stage_depth:  Dict[str, int],
+            group_of:     Dict[str, int],
+            subgroup_of:  Dict[str, Optional[str]],
+            valid_paths:  List[List[str]],
+    ) -> None:
+        self.nodes        = nodes
+        self.edges        = edges
+        self.predecessors = predecessors
+        self.stage_depth  = stage_depth
+        self.group_of     = group_of
+        self.subgroup_of  = subgroup_of
+        self.valid_paths  = valid_paths
+
+    # ── Serialisation ──────────────────────────────────────────────────────
+
+    def to_dict(self) -> Dict:
+        """Return a JSON-serialisable summary of the graph."""
+        return {
+            'nodes':       self.nodes,
+            'edges':       self.edges,
+            'stage_depth': self.stage_depth,
+            'valid_paths': self.valid_paths,
+        }
+
+    # ── Query helpers ───────────────────────────────────────────────────────
+
+    def get_stage_depth(self, stage: str) -> Optional[int]:
+        """Return the minimum pipeline depth of *stage*, or None if unknown."""
+        return self.stage_depth.get(stage)
+
+    def is_valid_transition(self, from_stage: str, to_stage: str) -> bool:
+        """Return True if *to_stage* is an immediate successor of *from_stage*."""
+        return to_stage in self.edges.get(from_stage, [])
+
+    def is_reachable(self, from_stage: str, to_stage: str) -> bool:
+        """
+        Return True if *to_stage* is reachable from *from_stage*.
+
+        Uses BFS over self.edges.  A stage is not considered reachable
+        from itself (returns False when from_stage == to_stage).
+        """
+        if from_stage == to_stage:
+            return False
+        visited = set()
+        queue   = deque([from_stage])
+        while queue:
+            current = queue.popleft()
+            if current == to_stage:
+                return True
+            if current in visited:
+                continue
+            visited.add(current)
+            queue.extend(self.edges.get(current, []))
+        return False
 
 # ---------------------------------------------------------------------------
 # Config file path
@@ -36,22 +174,6 @@ CONFIG_PATH   = os.path.join(_PROJECT_ROOT, 'config', 'config.yaml')
 
 # Directory containing config.yaml and any state JSON files
 _CONFIG_DIR = os.path.join(_PROJECT_ROOT, 'config')
-
-# ---------------------------------------------------------------------------
-# Allowed instruction type strings
-# Option A: plain strings rather than an enum so that instruction_type is a
-# simple str field on InstructionFormat.  All type comparisons in
-# instructions.py use string equality (e.g. if itype == 'I_TYPE': ...).
-# ---------------------------------------------------------------------------
-VALID_INSTRUCTION_TYPES: frozenset = frozenset({
-    'R_TYPE',
-    'I_TYPE',
-    'I_STORE',
-    'B_TYPE',
-    'J_TYPE',
-    'JR_TYPE',
-})
-
 
 # ---------------------------------------------------------------------------
 # BypassType dataclass
@@ -178,20 +300,20 @@ class PipelineConfig:
 
         Prefer the class methods (load_from_file, load_from_stream,
         load_from_dict) over calling this constructor directly.
-
-        Args:
-            data: A dict produced by yaml.safe_load() or equivalent.
-                  Missing top-level keys default to empty containers so
-                  all accessor methods are safe to call on partial configs.
         """
         self._data: Dict = data
 
         self.meta:           Dict[str, str] = data.get('meta', {})
         self._instructions:  Dict           = data.get('instructions', {})
-        self._bypass_types:  List           = data.get('bypass_types', [])
+        self._bypass_types:  List           = data.get('bypass_types', [])  # old format
+        self._bypass:        Dict           = data.get('bypass', {})        # new format
         self._pipeline:      Dict           = data.get('pipeline', {})
         self._defaults:      Dict           = data.get('defaults', {})
         self._rules:         List           = data.get('rules', [])
+
+        # Lazily populated by to_stage_sequence_graph()
+        self._stage_graph_cache: Optional[StageSequenceGraph] = None
+        self._stage_graph_built: bool                         = False
 
     # ------------------------------------------------------------------
     # Classmethods — preferred constructors
@@ -281,7 +403,13 @@ class PipelineConfig:
         return errors
 
     def _validate_instructions(self) -> List[str]:
-        """Validate the instructions block."""
+        """
+        Validate the instructions block.
+
+        New format requires only 'operands'.  'type' and 'format'/'syntax'
+        are optional — 'type' is validated only when present, so both old
+        and new instruction formats are accepted.
+        """
         errors: List[str] = []
 
         if not self._instructions:
@@ -296,18 +424,6 @@ class PipelineConfig:
                 )
                 continue
 
-            # type
-            if 'type' not in instr:
-                errors.append(
-                    f"Instruction '{name}': missing required field 'type'"
-                )
-            elif instr['type'] not in VALID_INSTRUCTION_TYPES:
-                errors.append(
-                    f"Instruction '{name}': invalid type '{instr['type']}'; "
-                    f"must be one of {sorted(VALID_INSTRUCTION_TYPES)}"
-                )
-
-            # operands
             if 'operands' not in instr:
                 errors.append(
                     f"Instruction '{name}': missing required field 'operands'"
@@ -317,18 +433,29 @@ class PipelineConfig:
                     f"Instruction '{name}': 'operands' must be a non-empty list"
                 )
 
-            # format
-            if 'format' not in instr:
+            # Validate 'type' only when the field is explicitly present (old format)
+            if 'type' in instr and instr['type'] not in VALID_INSTRUCTION_TYPES:
                 errors.append(
-                    f"Instruction '{name}': missing required field 'format'"
+                    f"Instruction '{name}': unrecognised type '{instr['type']}'; "
+                    f"valid values are {sorted(VALID_INSTRUCTION_TYPES)}"
                 )
 
         return errors
 
     def _validate_bypass_types(self) -> List[str]:
-        """Validate the bypass_types block. Missing block is allowed (returns empty)."""
+        """
+        Validate bypass type definitions.
+
+        Accepts both formats:
+        - Old: top-level bypass_types list with {name, color, description} entries
+        - New: bypass.colors dict mapping name → hex-color string
+
+        Neither section being present is non-blocking (only a warning), since
+        configs that use only ordering/capacity rules need no bypass types.
+        """
         errors: List[str] = []
 
+        # Old format
         for i, bt in enumerate(self._bypass_types):
             if not isinstance(bt, dict):
                 errors.append(
@@ -342,10 +469,26 @@ class PipelineConfig:
                         f"bypass_types[{i}]: missing required field '{required}'"
                     )
 
+        # New format
+        colors = self._bypass.get('colors', {})
+        if isinstance(colors, dict):
+            for bt_name, bt_color in colors.items():
+                if not isinstance(bt_color, str):
+                    errors.append(
+                        f"bypass.colors['{bt_name}']: color must be a hex string, "
+                        f"got {type(bt_color).__name__}"
+                    )
+
         return errors
 
     def _validate_pipeline_stages(self) -> List[str]:
-        """Validate the pipeline.stages block."""
+        """
+        Validate the pipeline.stages block for either format.
+
+        Old format: stage_name → integer capacity
+        New format: group_number → list of 'Name(capacity)' strings
+                    or          → dict of subgroup_name → list of strings
+        """
         errors: List[str] = []
         stages = self._pipeline.get('stages', {})
 
@@ -353,23 +496,63 @@ class PipelineConfig:
             errors.append("'pipeline.stages' block is empty or missing")
             return errors
 
-        for stage_name, stage_val in stages.items():
-            capacity = self._extract_capacity(stage_val)
-            if capacity is None:
-                errors.append(
-                    f"Stage '{stage_name}': capacity must be a non-negative "
-                    f"integer, got '{stage_val}'"
-                )
-            elif capacity < 0:
-                errors.append(
-                    f"Stage '{stage_name}': capacity must be >= 0, "
-                    f"got {capacity}"
-                )
+        is_new_format = any(
+            isinstance(k, int) or (isinstance(k, str) and str(k).isdigit())
+            for k in stages.keys()
+        )
+
+        if is_new_format:
+            for raw_key, group_val in stages.items():
+                gname = f"pipeline.stages[{raw_key}]"
+                if isinstance(group_val, list):
+                    for entry in group_val:
+                        try:
+                            _parse_stage_str(str(entry))
+                        except ValueError as exc:
+                            errors.append(f"{gname}: {exc}")
+                elif isinstance(group_val, dict):
+                    for sg_name, sg_list in group_val.items():
+                        if not isinstance(sg_list, list):
+                            errors.append(
+                                f"{gname}.{sg_name}: subgroup value must be"
+                                f" a list, got {type(sg_list).__name__}"
+                            )
+                            continue
+                        for entry in sg_list:
+                            try:
+                                _parse_stage_str(str(entry))
+                            except ValueError as exc:
+                                errors.append(f"{gname}.{sg_name}: {exc}")
+                else:
+                    errors.append(
+                        f"{gname}: value must be a list or a mapping, "
+                        f"got {type(group_val).__name__}"
+                    )
+        else:
+            # Old format
+            for stage_name, stage_val in stages.items():
+                capacity = self._extract_capacity(stage_val)
+                if capacity is None:
+                    errors.append(
+                        f"Stage '{stage_name}': capacity must be a non-negative "
+                        f"integer, got '{stage_val}'"
+                    )
+                elif capacity < 0:
+                    errors.append(
+                        f"Stage '{stage_name}': capacity must be >= 0, "
+                        f"got {capacity}"
+                    )
 
         return errors
 
     def _validate_rules(self) -> List[str]:
-        """Validate the rules block."""
+        """
+        Validate the rules block.
+
+        Only 'name' and 'description' are universally required.
+        'enabled' defaults to True when absent (new format omits it).
+        'type' is optional — rules may use when/then blocks instead.
+        """
         errors: List[str] = []
 
         for i, rule in enumerate(self._rules):
@@ -379,7 +562,7 @@ class PipelineConfig:
                     f"got {type(rule).__name__}"
                 )
                 continue
-            for required in ('name', 'description', 'enabled', 'type'):
+            for required in ('name', 'description'):
                 if required not in rule:
                     errors.append(
                         f"rules[{i}]: missing required field '{required}'"
@@ -554,98 +737,347 @@ class PipelineConfig:
         return os.path.abspath(os.path.join(_PROJECT_ROOT, path))
 
     # ------------------------------------------------------------------
+    # Pipeline structure parsing
+    # ------------------------------------------------------------------
+
+    def _parse_pipeline_structure(
+            self,
+    ) -> Tuple[List[Tuple[int, Optional[str], str, int]], bool]:
+        """
+        Parse pipeline.stages in either the old or the new grouped format.
+
+        Old format:  { stage_name: capacity_int, … }
+        New format:  { group_num: [Name(cap), …] | {subgroup: [Name(cap), …]} }
+
+        Returns:
+            Tuple of:
+              - List of (group_num, subgroup_or_None, stage_name, capacity)
+                in pipeline traversal order.
+              - bool: True when the new grouped/annotated format was detected.
+        """
+        stages = self._pipeline.get('stages', {})
+        all_stages: List[Tuple[int, Optional[str], str, int]] = []
+
+        if not stages:
+            return all_stages, False
+
+        is_new_format = any(
+            isinstance(k, int) or (isinstance(k, str) and str(k).isdigit())
+            for k in stages.keys()
+        )
+
+        if not is_new_format:
+            # Old format: flat {name: capacity}
+            for stage_name, stage_val in stages.items():
+                capacity = self._extract_capacity(stage_val)
+                all_stages.append((1, None, str(stage_name), capacity or 1))
+            return all_stages, False
+
+        # New format: {group_num: list | subgroup_dict}
+        for raw_key, group_val in stages.items():
+            group_num = int(raw_key)
+
+            if isinstance(group_val, list):
+                for stage_str in group_val:
+                    try:
+                        name, cap = _parse_stage_str(str(stage_str))
+                        all_stages.append((group_num, None, name, cap))
+                    except ValueError:
+                        pass  # Already flagged by _validate_pipeline_stages
+
+            elif isinstance(group_val, dict):
+                for subgroup_name, subgroup_list in group_val.items():
+                    if isinstance(subgroup_list, list):
+                        for stage_str in subgroup_list:
+                            try:
+                                name, cap = _parse_stage_str(str(stage_str))
+                                all_stages.append(
+                                    (group_num, str(subgroup_name), name, cap)
+                                )
+                            except ValueError:
+                                pass
+
+        return all_stages, True
+
+    @staticmethod
+    def _build_stage_sequence_graph(
+            all_stages: List[Tuple[int, Optional[str], str, int]],
+    ) -> 'StageSequenceGraph':
+        """
+        Build a StageSequenceGraph from the parsed stage tuple list.
+
+        Algorithm:
+          1. Group tuples by (group_num, subgroup).
+          2. Add sequential directed edges within each subgroup (A→B→C…).
+          3. Add inter-group edges from the last stage of every subgroup in
+             group N to the first stage of every subgroup in group N+1,
+             producing parallel-path semantics for multi-subgroup groups.
+          4. BFS from root nodes (no predecessors) to compute minimum-depth
+             stage indices used by the ordering rule.
+          5. DFS from roots to enumerate all complete root-to-leaf paths.
+
+        Args:
+            all_stages: List of (group_num, subgroup_or_None, stage_name,
+                        capacity) in pipeline traversal order.
+
+        Returns:
+            StageSequenceGraph
+        """
+        # ── 1. Collect stages by group / subgroup ─────────────────────
+        groups: Dict[int, Dict[Optional[str], List[str]]] = {}
+        for group_num, subgroup, name, _cap in all_stages:
+            groups.setdefault(group_num, {}).setdefault(subgroup, []).append(name)
+
+        sorted_group_nums: List[int] = sorted(groups.keys())
+
+        edges: Dict[str, List[str]] = {}
+        predecessors: Dict[str, List[str]] = {}
+        group_of: Dict[str, int] = {}
+        subgroup_of: Dict[str, Optional[str]] = {}
+
+        # ── 2. Intra-subgroup sequential edges ────────────────────────
+        for group_num, subgroup_dict in groups.items():
+            for sg_name, stage_list in subgroup_dict.items():
+                for stage in stage_list:
+                    group_of[stage] = group_num
+                    subgroup_of[stage] = sg_name
+                for i in range(len(stage_list) - 1):
+                    s1, s2 = stage_list[i], stage_list[i + 1]
+                    edges.setdefault(s1, []).append(s2)
+                    predecessors.setdefault(s2, []).append(s1)
+
+        # ── 3. Inter-group edges (last of group N → first of group N+1) ─
+        for idx in range(len(sorted_group_nums) - 1):
+            curr_gnum = sorted_group_nums[idx]
+            next_gnum = sorted_group_nums[idx + 1]
+
+            curr_lasts = [sl[-1] for sl in groups[curr_gnum].values() if sl]
+            next_firsts = [sl[0] for sl in groups[next_gnum].values() if sl]
+
+            for last_s in curr_lasts:
+                for first_s in next_firsts:
+                    edges.setdefault(last_s, []).append(first_s)
+                    predecessors.setdefault(first_s, []).append(last_s)
+
+        # ── 4. BFS depths (minimum distance from pipeline entry) ──────
+        nodes = list(group_of.keys())
+        root_nodes = [n for n in nodes if not predecessors.get(n)]
+
+        stage_depth: Dict[str, int] = {}
+        bfs_q: deque = deque((n, 0) for n in root_nodes)
+        while bfs_q:
+            node, depth = bfs_q.popleft()
+            if node not in stage_depth:
+                stage_depth[node] = depth
+                for succ in edges.get(node, []):
+                    bfs_q.append((succ, depth + 1))
+
+        # ── 5. All complete paths (DFS root → leaf) ───────────────────
+        valid_paths: List[List[str]] = []
+
+        def _dfs(node: str, path: List[str]) -> None:
+            path.append(node)
+            successors = edges.get(node, [])
+            if not successors:
+                valid_paths.append(list(path))
+            else:
+                for s in successors:
+                    _dfs(s, path)
+            path.pop()
+
+        for root in root_nodes:
+            _dfs(root, [])
+
+        return StageSequenceGraph(
+            nodes=nodes,
+            edges=edges,
+            predecessors=predecessors,
+            stage_depth=stage_depth,
+            group_of=group_of,
+            subgroup_of=subgroup_of,
+            valid_paths=valid_paths,
+        )
+
+    # ------------------------------------------------------------------
     # Data accessors — used by other pipeline modules and Flask routes
     # ------------------------------------------------------------------
 
     def to_instruction_formats(self) -> Dict[str, Dict]:
         """
-        Return instruction definitions in the shape expected by instructions.py
-        and by the Flask template variable injection.
+        Return instruction definitions for instructions.py and the template.
 
-        Replaces the hard-coded Instruction.FORMATS class variable.
+        Extends the old shape with new fields from the declarative config
+        ('valid_path', 'when_done', 'read_dependency', 'write_dependency').
+        Missing fields are returned as empty strings for forward compatibility.
 
         Returns:
-            dict: Maps instruction name (str) to a dict with keys:
-                  'type'     (str):       Instruction type string, e.g. 'R_TYPE'
-                  'operands' (List[str]): Ordered operand names, e.g. ['rd','rs1','rs2']
-                  'syntax'   (str):       Display format string, e.g. 'add rd, rs1, rs2'
+            dict mapping instruction mnemonic to:
+                'type'             (str):       Instruction type or ''
+                'operands'         (List[str]): Ordered operand names
+                'syntax'           (str):       Assembly template
+                'valid_path'       (str):       Pipeline path e.g. 'ALU'
+                'when_done'        (str):       Stage where result is ready
+                'read_dependency'  (str):       Dependency category
+                'write_dependency' (str):       Dependency category
         """
         return {
             name: {
-                'type':     instr.get('type', ''),
-                'operands': instr.get('operands', []),
-                'syntax':   instr.get('format', name),
+                'type':             instr.get('type', ''),
+                'operands':         instr.get('operands', []),
+                'syntax':           instr.get('format', instr.get('syntax', name)),
+                'valid_path':       instr.get('valid_path', ''),
+                'when_start':       instr.get('when_start', ''),
+                'when_done':        instr.get('when_done', ''),
+                'values_committed': instr.get('values_committed', ''),
+                'decoded':          instr.get('decoded', ''),
+                'read_dependency':  instr.get('read_dependency', ''),
+                'write_dependency': instr.get('write_dependency', ''),
             }
             for name, instr in self._instructions.items()
         }
 
-    def to_bypass_types(self) -> List[BypassType]:
+    def to_bypass_types(self) -> List['BypassType']:
         """
-        Build BypassType objects from the bypass_types block.
+        Build BypassType objects from either the new bypass.colors dict or
+        the old bypass_types list.
 
-        Replaces the hard-coded PipelineScheduler.PIPELINE_TYPES class variable.
+        New format (bypass.colors): name and color taken from the dict;
+        description defaults to the name.
+        Old format (bypass_types list): all three fields read directly.
 
         Returns:
-            List[BypassType]: One entry per valid bypass_type in the YAML.
-                                Empty list if the bypass_types block is absent.
+            List[BypassType]: Empty list if neither section is present.
         """
+        # ── New format: bypass.colors ─────────────────────────────────
+        colors_dict = self._bypass.get('colors', {})
+        if colors_dict and isinstance(colors_dict, dict):
+            return [
+                BypassType(name=str(k), color=str(v), description=str(k))
+                for k, v in colors_dict.items()
+                if isinstance(v, str)
+            ]
+
+        # ── Old format: top-level bypass_types list ───────────────────
         return [
             BypassType(
                 name=bt['name'],
                 color=bt['color'],
-                description=bt['description'],
+                description=bt.get('description', bt['name']),
             )
             for bt in self._bypass_types
             if isinstance(bt, dict)
-            and 'name'        in bt
-            and 'color'       in bt
-            and 'description' in bt
+               and 'name' in bt
+               and 'color' in bt
         ]
 
     def to_stage_capacities(self) -> Dict[str, int]:
         """
-        Return a mapping of stage name to absolute column capacity.
+        Return a mapping of stage name → absolute column capacity.
 
-        A capacity of 0 means the stage is unbounded and is exempt from
-        column-constraint rule checking.  There is no pipeline_count
-        multiplier; the value from the YAML is the direct limit.
+        Handles both the old flat dict format and the new grouped
+        Name(capacity) notation.  Capacity 0 means unbounded.
 
         Returns:
-            Dict[str, int]: e.g. {'F': 1, 'D': 1, 'i': 0, 'I': 1, ...}
+            Dict[str, int]: e.g. {'F': 1, 'D': 1, 'i*': 0, 'I': 1, 'X': 1, …}
         """
+        all_stages, is_new = self._parse_pipeline_structure()
+        if is_new:
+            return {name: cap for _g, _sg, name, cap in all_stages}
+
+        # Old format fallback
         stages = self._pipeline.get('stages', {})
         result: Dict[str, int] = {}
         for stage_name, stage_val in stages.items():
             capacity = self._extract_capacity(stage_val)
-            # Fall back to 1 (strict) rather than 0 (unbounded) on parse failure
             result[stage_name] = capacity if capacity is not None else 1
         return result
 
     def to_block_types(self) -> List[str]:
         """
-        Return an ordered list of stage name strings for building the palette.
+        Return an ordered list of stage name strings for the block palette.
 
-        Order is preserved from the YAML definition, so the palette reflects
-        the intended stage ordering of the config author.
+        New-format order: group 1 stages, then all group 2 sub-groups in
+        declaration order, then group 3 stages.
 
         Returns:
-            List[str]: e.g. ['F', 'D', 'i', 'I', 'Y0', 'Y1', 'Y2', 'Y3',
-                              'W', 'r', 'C', 'X']
+            List[str]: e.g. ['F','D','i*','I','Y0','Y1','Y2','Y3',
+                              'X','L0','L1','S','W','r*','C']
         """
+        all_stages, is_new = self._parse_pipeline_structure()
+        if is_new:
+            return [name for _g, _sg, name, _cap in all_stages]
         return list(self._pipeline.get('stages', {}).keys())
+
+    def to_stage_sequence_graph(self) -> Optional['StageSequenceGraph']:
+        """
+        Build and return the stage sequence graph (new format only).
+
+        The graph is built lazily on the first call and cached; subsequent
+        calls return the cached instance.
+
+        Returns:
+            StageSequenceGraph: Fully populated graph, or None if the config
+            uses the old flat pipeline stage format, which does not encode
+            stage ordering.
+        """
+        if not self._stage_graph_built:
+            all_stages, is_new = self._parse_pipeline_structure()
+            if is_new and all_stages:
+                self._stage_graph_cache = (
+                    PipelineConfig._build_stage_sequence_graph(all_stages)
+                )
+            else:
+                self._stage_graph_cache = None
+            self._stage_graph_built = True
+
+        return self._stage_graph_cache
 
     def to_rule_definitions(self) -> List[Dict]:
         """
         Return the raw rule dicts for the rule interpreter in rules.py.
 
-        Each dict is the complete YAML rule entry including the logic block.
-        RuleChecker.load_rules_from_config() inspects the 'type' field of
-        each dict to decide which Rule subclass to instantiate.
-
-        Returns:
-            List[Dict]: One dict per rule defined in the YAML.
+        Unchanged from the original — rules are returned as-is so
+        RuleChecker can inspect the 'type' field and dispatch accordingly.
         """
         return list(self._rules)
+
+    def to_dict(self) -> Dict:
+        """
+        Return a full JSON-serialisable representation of the config.
+
+        Includes 'stage_graph' (new format only) and synthesises
+        'bypass_types' from bypass.colors when the old list is absent.
+
+        Returns:
+            dict with keys:
+                meta, instruction_formats, bypass_types, stage_capacities,
+                block_types, rule_definitions, defaults, stage_graph
+        """
+        graph = self.to_stage_sequence_graph()
+
+        # Normalise bypass_types for the frontend (both formats → list-of-dicts)
+        bt_list = [bt for bt in self._bypass_types if isinstance(bt, dict)]
+        if not bt_list:
+            colors = self._bypass.get('colors', {})
+            bt_list = [
+                {'name': k, 'color': v, 'description': k}
+                for k, v in colors.items()
+                if isinstance(v, str)
+            ]
+
+        return {
+            'meta': self.meta,
+            'instruction_formats': self.to_instruction_formats(),
+            'bypass_types': bt_list,
+            'stage_capacities': self.to_stage_capacities(),
+            'block_types': self.to_block_types(),
+            'rule_definitions': self.to_rule_definitions(),
+            'defaults': {
+                'rows': self.default_rows,
+                'cols': self.default_cols,
+            },
+            'stage_graph': graph.to_dict() if graph else None,
+        }
 
     def get_default_state(self) -> Optional[Dict]:
         """
@@ -657,9 +1089,7 @@ class PipelineConfig:
         Returns:
             dict:  Parsed state dict if the path is set and readable.
             None:  If start_state is absent, the file does not exist, or
-                   the file contains invalid JSON.  Callers should treat
-                   None as "use empty defaults"; the warning about the
-                   missing file is surfaced separately via get_warnings().
+                   the file contains invalid JSON.
         """
         start_state = self._defaults.get('start_state')
         if not start_state or not isinstance(start_state, str):
@@ -672,40 +1102,6 @@ class PipelineConfig:
                 return json.load(fh)
         except (FileNotFoundError, json.JSONDecodeError):
             return None
-
-    def to_dict(self) -> Dict:
-        """
-        Return a full JSON-serializable representation of the config.
-
-        Used by the POST /api/config route to return everything the frontend
-        needs in a single response so it can update block types, instruction
-        formats, pipeline types, and rule info in one round trip.
-
-        Returns:
-            dict with keys:
-                meta                (dict):        name and description strings
-                instruction_formats (dict):        output of to_instruction_formats()
-                bypass_types        (List[dict]):  raw bypass_type entries
-                stage_capacities    (dict):        output of to_stage_capacities()
-                block_types         (List[str]):   output of to_block_types()
-                rule_definitions    (List[dict]):  output of to_rule_definitions()
-                defaults            (dict):        rows (int) and cols (int)
-        """
-        return {
-            'meta':                self.meta,
-            'instruction_formats': self.to_instruction_formats(),
-            'bypass_types': [
-                bt for bt in self._bypass_types
-                if isinstance(bt, dict)
-            ],
-            'stage_capacities':  self.to_stage_capacities(),
-            'block_types':       self.to_block_types(),
-            'rule_definitions':  self.to_rule_definitions(),
-            'defaults': {
-                'rows': self.default_rows,
-                'cols': self.default_cols,
-            },
-        }
 
     # ------------------------------------------------------------------
     # Convenience properties

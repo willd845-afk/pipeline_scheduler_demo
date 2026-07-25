@@ -1,229 +1,236 @@
 meta:
-  name: "Grid Pipeline Constraint Visualizer"
+  name: "Grid Pipeline Constraint DSL"
+  version: "1.0"
+  model_type: "constraint_validation_system"
   description: >
-    Users manually construct pipeline layouts and bypass connections
-    on a grid. The system validates rules and returns violation
-    highlights only. No simulation or execution semantics exist.
-  model_type: "editor_validation_system"
-
+    Fully declarative rule system for validating user-authored
+    pipeline grid layouts. No simulation or execution semantics.
 
 # --------------------------------------------------
-# INSTRUCTIONS (FIXED)
-# --------------------------------------------------
-instructions:
-  add:
-    operands: [rd, rs1, rs2]
-    type: R_TYPE
-    format: "add rd, rs1, rs2"
-
-  addi:
-    operands: [rd, rs1, imm]
-    type: I_TYPE
-    format: "addi rd, rs1, imm"
-
-  mul:
-    operands: [rd, rs1, rs2]
-    type: R_TYPE
-    format: "mul rd, rs1, rs2"
-
-  lw:
-    operands: [rd, rs1, imm]
-    type: I_STORE
-    format: "lw rd, imm(rs1)"
-
-  sw:
-    operands: [rs2, rs1, imm]
-    type: I_STORE
-    format: "sw rs2, imm(rs1)"
-
-  bne:
-    operands: [rs1, rs2, imm]
-    type: B_TYPE
-    format: "bne rs1, rs2, imm"
-
-  jr:
-    operands: [rs1]
-    type: JR_TYPE
-    format: "jr rs1"
-
-  jal:
-    operands: [rd, imm]
-    type: J_TYPE
-    format: "jal rd, imm"
-
-
-# --------------------------------------------------
-# BYPASS TYPES (FIXED: list format required)
-# --------------------------------------------------
-bypass_types:
-  - name: RAW
-    color: "#cc0000"
-    description: "Read After Write violation"
-
-  - name: WAR
-    color: "#cc6600"
-    description: "Write After Read violation"
-
-  - name: WAW
-    color: "#9900cc"
-    description: "Write After Write violation"
-
-  - name: CONTROL
-    color: "#006600"
-    description: "Control dependency violation"
-
-  - name: STRUCTURAL
-    color: "#0066cc"
-    description: "Resource / placement conflict"
-
-
-# --------------------------------------------------
-# PIPELINE
+# PIPELINE STRUCTURE (SCHEDULING LATTICE)
 # --------------------------------------------------
 pipeline:
   stages:
-    F: 1
-    D: 1
-    I: 1
-    X: 1
-    W: 1
-    C: 1
+    1: [F(1), D(1), i*(0), I(1)]
 
+    2:
+      MUL:   [Y0(1), Y1(1), Y2(1), Y3(1)]
+      ALU:   [X(1)]
+      LOAD:  [L0(1), L1(1)]
+      STORE: [S(1)]
+
+    3: [W(1), r*(0), C(1)]
 
 # --------------------------------------------------
-# RULES (FIXED: added type field everywhere)
+# INSTRUCTION MODEL (DEPENDENCY + PATH SEMANTICS)
+# --------------------------------------------------
+instructions:
+
+  add:
+    operands: [rd, rs1, rs2]
+    valid_path: ALU
+    format: "add rd, rs1, rs2"
+    read_dependency: reg_update
+    write_dependency: reg_update
+    when_done: X
+
+# --------------------------------------------------
+# RULE SYSTEM (PURE DECLARATIVE CONSTRAINTS)
 # --------------------------------------------------
 rules:
 
-  - name: "RAW Dependency Violation"
-    description: "Highlights RAW dependency conflicts on bypass edges"
-    type: validation
-    enabled: true
+  # ==================================================
+  # RAW DEPENDENCY RULE
+  # ==================================================
+  - name: "RAW Hazard"
+    type: "dependency_rule"
+    description: >
+      Detects Read After Write hazards where a consumer reads a register
+      written by a producer that occurs earlier in the pipeline, and the
+      dependency is not resolved via bypass.
+
     when:
       all:
-        - bypass_exists: true
-        - dependency_detected: RAW
-    then:
-      action:
-        type: highlight
-        target: bypass_annotation
-        color_ref: RAW
 
-  - name: "WAR Dependency Violation"
-    description: "Highlights WAR dependency conflicts"
-    type: validation
-    enabled: true
-    when:
-      dependency_detected: WAR
-    then:
-      action:
-        type: highlight
-        target: bypass_annotation
-        color_ref: WAR
+        # Same register dependency
+        - eq:
+            - writes(producer)
+            - reads(consumer)
 
-  - name: "WAW Dependency Violation" # the logic should live HERE
-    description: "Highlights WAW dependency conflicts"
-    type: validation
-    enabled: true
-    when:
-      dependency_detected: WAW
-    then:
-      action:
-        type: highlight
-        target: bypass_annotation
-        color_ref: WAW
+        # Temporal ordering constraint
+        - lt:
+            - stage_index(stage_of(producer))
+            - stage_index(stage_of(consumer))
 
-  - name: "Structural Grid Conflict"
-    description: "Detects overlapping or over-capacity stage placement"
-    type: validation
-    enabled: true
-    when:
-      grid_cell_overlapping: true
-    then:
-      action:
-        type: highlight
-        target: grid_cell
-        color_ref: STRUCTURAL
+        # No bypass resolution
+        - not:
+            bypass_exists:
+              args: [producer, consumer]
 
-  - name: "Control Dependency Warning"
-    description: "Marks control-related instructions for visualization"
-    type: validation
-    enabled: true
-    when:
-      instruction_type: [bne, jr, jal]
     then:
-      action:
-        type: highlight
-        target: bypass_annotation
-        color_ref: CONTROL
-  # --------------------------------------------------
-  # COLUMN CAPACITY CONSTRAINT
-  # --------------------------------------------------
-  - name: "Pipeline Stage Capacity Per Column"
+      highlight:
+        type: "dependency"
+        label: "RAW"
+        color: "#cc0000"
+
+  # ==================================================
+  # PIPELINE SEQUENCE RULE
+  # ==================================================
+  - name: "Pipeline Sequence Constraint"
+    type: "ordering_rule"
     description: >
-      Ensures no column contains more pipeline stages than
-      the capacity defined in pipeline.stages
-    enabled: true
-    type: column_constraint
-
-    logic:
-      scope: column
-      target: grid_data
-
-      constraint:
-        group_by: stage
-
-        limit:
-          from: pipeline.stages
-          key: stage
-
-        ignore_if:
-          capacity_equals: 0
-
-        violation_message: >
-          Column {col} exceeds allowed stage capacity defined in pipeline.stages
-
-
-  # --------------------------------------------------
-  # STRICT PIPELINE ORDER CONSTRAINT
-  # --------------------------------------------------
-  - name: "Pipeline Stage Order Constraint"
-    description: >
-      Enforces strict left-to-right ordering:
-      F → D → I → X → W → C
-    enabled: true
-    type: validation
+      Ensures instruction progression follows the pipeline-defined stage order
+      declared in pipeline.stages. No independent ordering logic is defined here.
 
     when:
-      stage_order_violation: true
+      any:
 
-      # explicit allowed sequence definition (for validator reference)
-      allowed_sequence:
-        - F
-        - D
-        - I
-        - X
-        - W
-        - C
+        # --------------------------------------------
+        # VIOLATION 1: backward movement in stage lattice
+        # --------------------------------------------
+        - lt:
+            - stage_index(stage_of(current))
+            - stage_index(stage_of(previous))
+
+        # --------------------------------------------
+        # VIOLATION 2: stage not consistent with pipeline path
+        # (resolved via pipeline.stages lookup)
+        # --------------------------------------------
+        - not:
+            in_pipeline_order:
+              args:
+                - stage_of(previous)
+                - stage_of(current)
 
     then:
-      action:
-        type: highlight
-        target: grid_cell
-        color_ref: STRUCTURAL
+      highlight:
+        type: "ordering_violation"
+        label: "SEQ"
+        color: "#006600"
+
+  # ==================================================
+  # RESOURCE / CAPACITY RULE
+  # ==================================================
+  - name: "Resource Capacity Constraint"
+    type: "capacity_rule"
+    description: >
+      Ensures that pipeline stage resources are not exceeded per column.
+      Each stage group has a fixed capacity defined in the pipeline lattice.
+
+    when:
+      any:
+
+        # overuse of stage resources in a column
+        - gt:
+            - resource_used(stage(current), column(current))
+            - stage_capacity(stage(current))
+
+    then:
+      highlight:
+        type: "resource_violation"
+        label: "CAP"
+        color: "#0066cc"
+
+  # ==================================================
+  # WAR DEPENDENCY RULE
+  # ==================================================
+  - name: "WAR Hazard"
+    type: "dependency_rule"
+    description: >
+      Detects Write After Read hazards where a later instruction writes
+      a register that an earlier instruction reads. In an in-order
+      pipeline this is typically benign, but may indicate a register
+      renaming opportunity or an out-of-order conflict.
+    when:
+      all:
+
+        # Producer reads what consumer writes
+        - eq:
+            - reads(producer)
+            - writes(consumer)
+
+        # Producer is earlier in pipeline than consumer
+        - lt:
+            - stage_index(stage_of(producer))
+            - stage_index(stage_of(consumer))
+
+        # No bypass annotation resolves this pair
+        - not:
+            bypass_exists:
+              args: [producer, consumer]
+
+    then:
+      highlight:
+        type: "dependency"
+        label: "WAR"
+        color: "#cc6600"
+
+  # ==================================================
+  # WAW DEPENDENCY RULE
+  # ==================================================
+  - name: "WAW Hazard"
+    type: "dependency_rule"
+    description: >
+      Detects Write After Write hazards where two instructions write
+      the same destination register. If the pipeline can complete
+      writes out of order, the earlier write may overwrite the later
+      one, corrupting architectural state.
+    when:
+      all:
+
+        # Both instructions write the same register
+        - eq:
+            - writes(producer)
+            - writes(consumer)
+
+        # Producer is earlier in pipeline than consumer
+        - lt:
+            - stage_index(stage_of(producer))
+            - stage_index(stage_of(consumer))
+
+        # No bypass annotation resolves this pair
+        - not:
+            bypass_exists:
+              args: [producer, consumer]
+
+    then:
+      highlight:
+        type: "dependency"
+        label: "WAW"
+        color: "#9900cc"
 
 # --------------------------------------------------
-# DEFAULTS
+# BYPASS MODEL (VISUAL ONLY — FUNCTIONALLY EQUIVALENT)
+# --------------------------------------------------
+bypass:
+
+  semantics: "uniform"
+
+  exists(a, b): true
+
+  annotation_only: true
+
+  colors:
+    RAW: "#cc0000"
+    WAR: "#cc6600"
+    WAW: "#9900cc"
+    CONTROL: "#006600"
+    STRUCTURAL: "#0066cc"
+
+# --------------------------------------------------
+# DEFAULT BEHAVIOR
 # --------------------------------------------------
 defaults:
-  mode: "validation_only"
-  rows: 10
-  cols: 10
-  start_state: "./config/tiny_rv1_example.json"
 
-  unknown_state:
+  evaluation_mode: "validation_only"
+
+  unknown_expression:
     action: ignore
 
-  no_rule_match:
+  no_violation:
     action: no_highlight
     
+  rows: 10
+  cols: 10
+  
+  start_state: "./config/tiny_rv1_example.json"

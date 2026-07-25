@@ -8,9 +8,9 @@ rule checking, and pipeline management.
 
 from .instructions import (Instruction, InstructionFormat,
                             set_instruction_formats, get_instruction_formats)
-from .rules import Rule, Violation, RuleChecker # maybe remove rule?
+from .rules import Rule, Violation, RuleChecker
 from .scheduler import PipelineScheduler, BypassAnnotation
-from .config import PipelineConfig, BypassType      # was from .scheduler import BypassType
+from .config import PipelineConfig, BypassType
 
 __all__ = [
     'Instruction',
@@ -21,5 +21,6 @@ __all__ = [
     'Violation',
     'RuleChecker',
     'PipelineScheduler',
-    'PipelineConfig'
+    'PipelineConfig',
+    'BypassType'
 ]
